@@ -1,0 +1,45 @@
+module sh.sysl.musicbox
+
+// Q1.31 fixed point: a number in [-1, 1) held as an `i32` counting units of 2^-31.
+//
+// Everything the renderer does per sample is in this format, because a Cortex-M0 has no floating
+// point at all and a Cortex-M33's is single precision. Every float a note needs -- a frequency, an
+// envelope's curve, a partial's share of the mix -- is converted once, before playback, and what runs
+// per sample is integer arithmetic.
+//
+// **The arithmetic saturates rather than wraps.** An integer that overflows in audio is a full-scale
+// click, and the one place a clipped value is the right answer is a mix that got too loud. So `+`,
+// `-` and unary `-` stop at the ends of the range, and `*` does too in the one case that can leave
+// it: -1 times -1, which is +1 and is not representable.
+//
+// The product is `(a * b) >> 31` through a 64-bit intermediate, which is a single `smull` and two
+// shifts on Armv7-M and Armv8-M; Armv6-M has no 64-bit multiply and calls the runtime's for it.
+struct Q31 derives Eq, Ord, Display
+    raw: i32
+
+    // The value as a float, for a test or a display. Not for the per-sample path.
+    as_real(self) -> real = real(self.raw) / 2147483648.0
+
+// The nearest Q31 to a float, saturated: 1.0 and above become the largest value, -1.0 and below the
+// smallest. A literal argument is folded by the optimizer, so `q31(0.6)` inside a function costs
+// nothing at run time -- but a module-level `val` holding one is filled by an initializer, which a
+// freestanding target has nowhere to run, so write such a constant inside the function that uses it.
+q31(x: real) -> Q31 = Q31(i32(x * 2147483648.0))
+
+private const Q31_MAX: i64 = 2147483647
+private const Q31_MIN: i64 = -2147483648
+
+private saturate(x: i64) -> Q31 =
+    if x > Q31_MAX then Q31(2147483647) else if x < Q31_MIN then Q31(-2147483648) else Q31(i32(x))
+
+impl Add for Q31
+    add(self, rhs: Q31) -> Q31 = saturate(i64(self.raw) + i64(rhs.raw))
+
+impl Sub for Q31
+    sub(self, rhs: Q31) -> Q31 = saturate(i64(self.raw) - i64(rhs.raw))
+
+impl Mul for Q31
+    mul(self, rhs: Q31) -> Q31 = saturate((i64(self.raw) * i64(rhs.raw)) >> 31)
+
+impl Neg for Q31
+    neg(self) -> Q31 = saturate(-i64(self.raw))
