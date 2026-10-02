@@ -21,15 +21,15 @@ private us(seconds: real) -> u64 = u64(seconds * 1000000.0 + 0.5)
 // The keys of a text's notes, in order, as equal-tempered frequencies.
 private assert_keys(text: string, keys: []const int)
     val ns = notes_of(text)
-    assert_eq(ns.len, keys.len, "how many notes `{text}` makes")
+    assert_eq(ns.len, keys.len, s"how many notes `${text}` makes")
     for i in 0..<keys.len
-        assert_eq(ns[i].frequency, key_hz(keys[i]), "note {i} of `{text}`")
+        assert_eq(ns[i].frequency, key_hz(keys[i]), s"note ${i} of `${text}`")
 
 private assert_starts(text: string, starts: []const real)
     val ns = notes_of(text)
-    assert_eq(ns.len, starts.len, "how many notes `{text}` makes")
+    assert_eq(ns.len, starts.len, s"how many notes `${text}` makes")
     for i in 0..<starts.len
-        assert_eq(ns[i].start, us(starts[i]), "the start of note {i} of `{text}`")
+        assert_eq(ns[i].start, us(starts[i]), s"the start of note ${i} of `${text}`")
 
 private failure(text: string) -> Diagnostic = parse(text) match
     Ok(_) -> panic(s"`$text` was not refused")
@@ -40,8 +40,8 @@ private place(text: string, d: Diagnostic) -> Loc = source_of("score", text).loc
 
 private assert_refused(text: string, message: string, line: usize, col: usize)
     val d = failure(text)
-    assert_eq(d.message, message, "the refusal of `{text}`")
-    assert_eq(place(text, d), Loc(line, col), "where the refusal of `{text}` points")
+    assert_eq(d.message, message, s"the refusal of `${text}`")
+    assert_eq(place(text, d), Loc(line, col), s"where the refusal of `${text}` points")
 
 @test("the seven letters are the white keys up from middle C, a quarter note apart at 120")
 letters()
@@ -147,7 +147,7 @@ key_signatures()
                 val natural = key_hz([65, 60, 67, 62, 69, 64, 71][j])
                 if ns[j].frequency != natural then altered += 1
             val count = if fifths < 0 then -fifths else fifths
-            assert_eq(altered, count, "`{tonic} {name}` alters {count} letters")
+            assert_eq(altered, count, s"`${tonic} ${name}` alters ${count} letters")
 end key_signatures
 
 @test("a written accidental replaces the key's, so n is a natural against the key")
@@ -205,7 +205,7 @@ instruments()
     assert_eq(ns[2].instrument, 0)
 
     for name in ["sine", "organ", "clarinet", "bell", "pluck"]
-        assert(parse(s"[instrument $name] c").is_ok(), "`{name}` is built in")
+        assert(parse(s"[instrument $name] c").is_ok(), s"`${name}` is built in")
 end instruments
 
 @test("a registered instrument is named like a built-in one, and is looked up first")
@@ -346,7 +346,7 @@ readme_examples()
             if line == "```" then
                 inside = false
                 blocks += 1
-                assert(parse(block).is_ok(), "the README block\n{block}\nparses")
+                assert(parse(block).is_ok(), s"the README block\n${block}\nparses")
             else
                 block = s"$block$line\n"
         else if line == "```musicbox" then
@@ -362,11 +362,11 @@ end_to_end()
 
     val high = parse("[tempo 60] [key g major] [octave 5] f").unwrap()
     val n = crossings(high)
-    assert(n == 369 || n == 370, "half a second of F#5, 739.99 Hz, crossed {n} times")
+    assert(n == 369 || n == 370, s"half a second of F#5, 739.99 Hz, crossed ${n} times")
 
     val tuned = parse("[tempo 60] [temperament werckmeister] a").unwrap()
     val w = crossings(tuned)
-    assert(w == 218 || w == 219, "half a second of Werckmeister's A, 437.85 Hz, crossed {w} times")
+    assert(w == 218 || w == 219, s"half a second of Werckmeister's A, 437.85 Hz, crossed ${w} times")
 end end_to_end
 
 // Upward zero crossings in the middle half second of a score rendered at 48 kHz.

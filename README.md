@@ -6,7 +6,7 @@ same code renders a WAV file on a laptop and feeds an I2S buffer on a Pico.
 
 ```hocon
 dependencies {
-  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.0" }
+  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.1" }
 }
 ```
 
@@ -37,6 +37,15 @@ write_bytes("chord.wav", render_wav(song, 44100).unwrap().view()).unwrap()
 - **The output is a pull.** `render(*self, out: []i16) -> bool` fills a buffer with mono samples at the
   rate the synth was built with, and answers false once the score has finished. It knows nothing about
   any audio device, so it fits a callback, a DMA ring or a file equally.
+- **`seek(sample)` lands where continuous play would have been.** A note sounding at the seek point
+  plays on from it -- its envelope at the level and stage it had reached, released if its release
+  point has passed, every partial at the phase it had turned to -- and a note that has died away stays
+  silent. The samples after a seek are the ones play produces, to the bit, even past 32 voices: the
+  notes before the point are started in order on the voices play would have given them, so a note that
+  finds the pool full steals the voice that was quietest then. The work is done in `seek`, once:
+  each earlier note's attack and sustain are crossed at once and its decay and release curves (the
+  whole of a pluck) are stepped sample by sample, since an integer recurrence has no bit-exact closed
+  form. `render` is unchanged. `rewind()` is `seek(0)`.
 - **Instruments are plain data**: up to eight sine partials, each a ratio of the note's frequency and
   a share of its level, and an envelope -- `Adsr` or `Pluck`, an enum with payloads.
 - **Articulation is a release point that is not the written length.** `note(...).held(seconds)` lets a
@@ -232,4 +241,7 @@ sysl test .
 The tests measure the rendered samples: pitch by counting zero crossings, the envelope by the peak of
 each cycle, clicks by the largest step from one sample to the next, voice stealing by comparing against
 a score that never had the stolen note (the mix is an exact integer sum, so the two are byte-identical
-only if the quietest voice was taken), and saturation against twice a single note, clamped.
+only if the quietest voice was taken), and saturation against twice a single note, clamped. Seeking is
+held to continuous play sample for sample, at points mid-attack, mid-decay, mid-sustain, mid-release,
+on a note's start, on a release point and between notes, deep into a long sustain, and past the voice
+pool.
