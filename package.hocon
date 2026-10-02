@@ -24,7 +24,13 @@ package {
 // still builds it; the floats are in setting a score and a synth up, and the per-sample loop is
 // integer arithmetic.
 //
-// The one heap user is `render_wav`, which grows a buffer for a whole file. A program that never
-// calls it never reaches the allocator.
+// The heap users are `render_wav`, which grows a buffer for a whole file, and `parse`, which grows a
+// score's notes. A program that calls neither never reaches the allocator, which is why the
+// `parsing` dependency's own `requires { heap = true }` is not restated here.
 requires {
+}
+
+// The text notation reads through the organisation's parsing toolkit.
+dependencies {
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.10.0" }
 }

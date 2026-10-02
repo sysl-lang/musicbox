@@ -1,0 +1,496 @@
+module sh.sysl.musicbox
+
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+import sysl.slices.sort_stable_by
+import sh.sysl.parsing.{Diagnostic, LitError, Number, Scanner, Span, error, expected, is_digit,
+                        is_ident_cont, is_ident_start, nearest_name, read_digits, read_number,
+                        scanner_of, source_of, where}
+
+// The text notation: a score written as a line of LilyPond-like music and read into a `Score`.
+//
+//     [tempo 96] [key g major] [instrument organ]
+//     << g4 a b c' | <g, b, d>1 >>
+//
+// The grammar is in the README, with every example there run by the tests. Everything a piece says
+// about itself -- its tempo, key, temperament, transposition, volume, instrument and voices -- is
+// written in the text, so `parse` takes nothing but the text.
+//
+// **Errors name the line and point at the column.** `parse` answers a `Diagnostic` from
+// `sh.sysl.parsing`, whose span indexes the text, and `explain` renders it against that text in the
+// form the sysl compiler prints:
+//
+//     error: a duration is 1, 2, 4, 8, 16, 32 or 64
+//      --> score:1:4
+//       |
+//     1 | c4 d3 e
+//       |    ^ found `3`
+
+// How long a note sounds against how long it is written: the release point as a share of its length.
+enum Articulation
+    Normal
+    Staccato
+    Tenuto
+    Legato
+
+// What a note's articulation makes of its written length. A plain note is let go a little early, as
+// a player separates notes; staccato halves it, tenuto holds it all, and legato holds it past its
+// end so the next note starts under it.
+private release_share(a: Articulation) -> real = a match
+    Normal -> 0.9
+    Staccato -> 0.5
+    Tenuto -> 1.0
+    Legato -> 1.1
+
+// The most notes one chord may hold.
+private const MAX_CHORD: usize = 16
+
+// Everything a directive changes, and everything a note inherits from the notes before it.
+//
+// **A voice of a `<<` gets a copy**, so a directive written inside one voice is that voice's alone,
+// and after the `>>` the music goes on with what was in force before the `<<`. The groups that are
+// not voices -- a slur, a tuplet -- share the state around them.
+private struct State
+    tempo: real                 // quarter notes a minute
+    fifths: int                 // the key signature: sharps above zero, flats below
+    temperament: Temperament
+    transpose: int              // semitones
+    volume: real                // a note's velocity, 0 to 1
+    instrument: Option[u16]     // an index into the score's instruments; none until one is used
+    octave: int                 // the octave an unmarked `c` begins
+    value: u64                  // the sticky duration: 4 is a quarter note
+    scale: real                 // a tuplet's share of the written length, 1 outside one
+    slur: bool                  // inside `( ... )`, where a note with no articulation is legato
+end State
+
+// Where a sequence of music stops: the end of the text, or the closer of the group it is inside.
+private enum Stop
+    Top
+    Voices(open: Span)
+    Slur(open: Span)
+    Tuplet(open: Span)
+
+private struct Reader
+    s: Scanner
+    notes: Buf[Note]
+    instruments: Buf[Instrument]
+    names: Buf[string]
+    registered: []const Named
+
+    // The notes of the last event read, and whether their legato came from a slur rather than from
+    // the note itself -- the end of a slur lets its last event go as a plain note.
+    last_from: usize
+    last_to: usize
+    last_slurred: bool
+end Reader
+
+// The score a text describes, with the built-in instruments.
+parse(text: string) -> Result[Score, Diagnostic] = parse_with(text, [])
+
+// The score a text describes, where `[instrument name]` may also name one of `registered`.
+parse_with(text: string, registered: []const Named) -> Result[Score, Diagnostic]
+    var r = Reader(scanner_of(text), buf(), buf(), buf(), registered, 0, 0, false)
+    var st = State(120.0, 0, Equal, 0, 1.0, None, 4, 4, 1.0, false)
+
+    sequence(&r, &st, 0.0, Top)?
+
+    // Voices are read one after another, so their notes arrive grouped by voice. A stable sort puts
+    // them in start order and keeps a chord's notes, and simultaneous voices, in the order written.
+    var scratch: Buf[Note] = buf()
+    scratch.extend(r.notes.view())
+    sort_stable_by(r.notes.view(), scratch.view(), (a, b) -> a.start < b.start)
+
+    score(r.notes.view(), r.instruments.view()) match
+        Ok(sc) -> Ok(sc)
+        Err(e) -> Err(error(Span(0, 0), s"$e"))
+end parse_with
+
+// A diagnostic from `parse`, rendered against the text it is about: the message, the line and
+// column, the line itself, and a caret under the place.
+explain(text: string, d: Diagnostic) -> string = d.render(source_of("score", text))
+
+// -- sequences ------------------------------------------------------------------------------------
+
+// Music up to `stop`, starting at `start` seconds; answers when it ends. The closer is left for the
+// caller, which knows what it opened.
+private sequence(r: *Reader, st: *State, start: real, stop: Stop) -> Result[real, Diagnostic]
+    var now = start
+    loop
+        trivia(r)
+
+        val c = r.s.peek() match
+            Some(c) -> c
+            None -> return stop match
+                Top -> Ok(now)
+                Voices(open) -> Err(unclosed(open, "`<<`", "`>>`"))
+                Slur(open) -> Err(unclosed(open, "`(`", "`)`"))
+                Tuplet(open) -> Err(unclosed(open, "`{`", "`}`"))
+
+        val here = Span(r.s.offset, r.s.offset + 1)
+
+        val closes = stop match
+            Voices(_) -> c == u8('|') || r.s.starts_with(">>".bytes)
+            Slur(_) -> c == u8(')')
+            Tuplet(_) -> c == u8('}')
+            Top -> false
+        if closes then return Ok(now)
+
+        if c == u8('|') || r.s.starts_with(">>".bytes) then
+            return Err(error(here, "there is no `<<` open here to separate or close")
+                .with_note("simultaneous voices are written `<< one | two >>`"))
+        if c == u8(')') then return Err(error(here, "there is no `(` open here to close"))
+        if c == u8('}') then return Err(error(here, "there is no `{` open here to close"))
+
+        if c == u8('[') then
+            directive(r, st)?
+        else if r.s.starts_with("<<".bytes) then
+            now = voices(r, st, now)?
+        else if c == u8('(') then
+            now = slur(r, st, now)?
+        else if c == u8('{') then
+            now = tuplet(r, st, now)?
+        else
+            now = event(r, st, now)?
+end sequence
+
+// Whitespace and `%` comments, which run to the end of the line.
+private trivia(r: *Reader)
+    loop
+        r.s.skip_space()
+        if !r.s.skip_line_comment("%".bytes) then return
+
+private unclosed(open: Span, what: string, closer: string) -> Diagnostic =
+    error(open, s"this $what is never closed").with_label(s"expected a $closer before the end")
+
+// `<< a | b | ... >>`: voices that all begin where the `<<` stands. The music after the `>>` begins
+// when the longest of them ends.
+private voices(r: *Reader, st: *State, start: real) -> Result[real, Diagnostic]
+    val open = Span(r.s.offset, r.s.offset + 2)
+    r.s.at += 2
+
+    var end = start
+    loop
+        var own = *st
+        val t = sequence(r, &own, start, Voices(open))?
+        if t > end then end = t
+
+        if !r.s.accept(u8('|')) then
+            r.s.at += 2
+            return Ok(end)
+end voices
+
+// `( ... )`: a slur. Every note in it is legato except the last, which is let go as written.
+private slur(r: *Reader, st: *State, start: real) -> Result[real, Diagnostic]
+    val open = Span(r.s.offset, r.s.offset + 1)
+    r.s.at += 1
+
+    val outer = st.slur
+    st.slur = true
+    val end = sequence(r, st, start, Slur(open))?
+    r.s.at += 1
+    st.slur = outer
+
+    // Inside an enclosing slur the last note still leads on into the next.
+    if !outer && r.last_slurred then
+        for i in r.last_from..<r.last_to
+            val n = r.notes[i]
+            r.notes[i] = n.held(real(n.length) / 1000000.0 * release_share(Normal))
+
+    Ok(end)
+end slur
+
+// `{n:m ... }`: a tuplet, `n` notes in the time of `m`. Without `:m`, `m` is the largest power of two
+// below `n`, so `{3` is a triplet in the time of two and `{5` a quintuplet in the time of four.
+private tuplet(r: *Reader, st: *State, start: real) -> Result[real, Diagnostic]
+    val open = Span(r.s.offset, r.s.offset + 1)
+    r.s.at += 1
+
+    val n = count(r, "a tuplet opens with how many notes it holds, as in `{3 c8 d e}`")?
+    var m: u64 = 1
+    if r.s.accept(u8(':')) then
+        m = count(r, "a tuplet's `:` is followed by the notes it takes the time of, as in `{3:2`")?
+    else
+        while m * 2 < n do m *= 2
+
+    if n < 2 then return Err(error(Span(open.start, r.s.offset), "a tuplet holds at least two notes"))
+
+    val outer = st.scale
+    st.scale = outer * real(m) / real(n)
+    val end = sequence(r, st, start, Tuplet(open))?
+    r.s.at += 1
+    st.scale = outer
+
+    Ok(end)
+end tuplet
+
+// A positive whole number written immediately here.
+private count(r: *Reader, want: string) -> Result[u64, Diagnostic]
+    val from = r.s.offset
+    val v = read_digits(&r.s, 10) match
+        Ok(v) -> v
+        Err(e) -> return Err(lit_error(r, e, want))
+
+    if v == 0 then return Err(error(Span(from, r.s.offset), want))
+    Ok(v)
+end count
+
+private lit_error(r: *Reader, e: LitError, want: string) -> Diagnostic =
+    error(where(e), want).with_label(s"found ${found(r, where(e))}")
+
+// What is at a place, for the `found` half of a message: the text there in backticks, or the end of
+// the input.
+private found(r: *Reader, at: Span) -> string
+    if at.start >= r.s.src.len then return "the end of the input"
+    s"`${str_cast(r.s.src[at.start..<at.start + 1])}`"
+
+// -- notes ----------------------------------------------------------------------------------------
+
+// One note, rest or chord, with its duration, dots and articulation; answers when it ends.
+private event(r: *Reader, st: *State, now: real) -> Result[real, Diagnostic]
+    var keys: [MAX_CHORD]int
+    var count: usize = 0
+
+    val c = r.s.peek().unwrap()
+
+    if c == u8('<') then
+        val open = Span(r.s.offset, r.s.offset + 1)
+        r.s.at += 1
+        loop
+            trivia(r)
+            if r.s.accept(u8('>')) then break
+            if r.s.at_end() then return Err(unclosed(open, "chord", "`>`"))
+            if count == MAX_CHORD then
+                return Err(error(Span(open.start, r.s.offset), "a chord holds at most 16 notes"))
+            keys[count] = key(r, st)?
+            count += 1
+
+        if count == 0 then return Err(error(Span(open.start, r.s.offset), "a chord holds at least one note"))
+    else if c == u8('r') then
+        r.s.at += 1
+    else if c >= u8('a') && c <= u8('g') then
+        keys[0] = key(r, st)?
+        count = 1
+    else
+        val at = Span(r.s.offset, r.s.offset + 1)
+        return Err(expected(at, "a note, a rest, a chord or a directive", found(r, at))
+            .with_note("a note is a letter `a` to `g`, a rest `r`, a chord `<c e g>` and a directive `[tempo 90]`"))
+
+    if r.s.peek().map(is_digit).unwrap_or(false) then
+        val from = r.s.offset
+        val v = read_digits(&r.s, 10).unwrap_or(0)
+        if v != 1 && v != 2 && v != 4 && v != 8 && v != 16 && v != 32 && v != 64 then
+            return Err(error(Span(from, r.s.offset), "a duration is 1, 2, 4, 8, 16, 32 or 64")
+                .with_label(s"found `${str_cast(r.s.src[from..<r.s.offset])}`"))
+        st.value = v
+
+    // Each dot adds half of what the last one added: one is half again, two is three quarters.
+    var share = 1.0
+    var dot = 0.5
+    while r.s.accept(u8('.'))
+        share += dot
+        dot /= 2.0
+
+    var art = if st.slur then Legato else Normal
+    var slurred = st.slur
+    if r.s.peek() == Some(u8('-')) then
+        val from = r.s.offset
+        r.s.at += 1
+        if r.s.accept(u8('.')) then
+            art = Staccato
+        else if r.s.accept(u8('-')) then
+            art = Tenuto
+        else
+            return Err(error(Span(from, r.s.offset + 1), "an articulation is `-.` for staccato or `--` for tenuto"))
+        slurred = false
+
+    val length = 4.0 / real(st.value) * share * st.scale * 60.0 / st.tempo
+
+    if count > 0 then
+        val ins = current(r, st)?
+        r.last_from = r.notes.len()
+        for i in 0..<count
+            val n = note(now, length, frequency(keys[i], st.temperament), st.volume, ins)
+            r.notes.push(n.held(length * release_share(art)))
+        r.last_to = r.notes.len()
+        r.last_slurred = slurred
+
+    Ok(now + length)
+end event
+
+// The MIDI key a pitch names: a letter, its accidentals, its octave marks, then the key signature,
+// the octave and the transposition in force.
+private key(r: *Reader, st: *State) -> Result[int, Diagnostic]
+    val from = r.s.offset
+    val letter = r.s.peek().unwrap_or(0)
+    if letter < u8('a') || letter > u8('g') then
+        val at = Span(from, from + 1)
+        return Err(expected(at, "a pitch, a letter `a` to `g`", found(r, at)))
+    r.s.at += 1
+
+    // A written accidental replaces the key's, so `cn` is a C natural in D major.
+    var shift = key_accidental(st.fifths, letter)
+    if r.s.accept(u8('n')) then
+        shift = 0
+    else if r.s.peek() == Some(u8('s')) || r.s.peek() == Some(u8('f')) then
+        shift = 0
+        loop
+            if r.s.accept(u8('s')) then shift += 1
+            else if r.s.accept(u8('f')) then shift -= 1
+            else break
+
+    var octave = st.octave
+    loop
+        if r.s.accept(u8('\'')) then octave += 1
+        else if r.s.accept(u8(',')) then octave -= 1
+        else break
+
+    val k = (octave + 1) * 12 + letter_semitone(letter) + shift + st.transpose
+    if k < 0 || k > 127 then
+        return Err(error(Span(from, r.s.offset), "this pitch is outside the range of MIDI keys 0 to 127")
+            .with_label(s"key $k"))
+    Ok(k)
+end key
+
+// The instrument a note is played on: the one a directive chose, or `sine` if none has been.
+private current(r: *Reader, st: *State) -> Result[u16, Diagnostic]
+    st.instrument match
+        Some(i) -> return Ok(i)
+        None -> ()
+
+    val i = resolve(r, "sine", Span(r.s.offset, r.s.offset))?
+    st.instrument = Some(i)
+    Ok(i)
+end current
+
+// The score's index for the instrument called `name`, adding it the first time it is named.
+private resolve(r: *Reader, name: string, at: Span) -> Result[u16, Diagnostic]
+    for i in 0..<r.names.len()
+        if r.names[i] == name then return Ok(u16(i))
+
+    var made: Option[Instrument] = None
+    for i in 0..<r.registered.len
+        if r.registered[i].name == name then
+            made = Some(r.registered[i].instrument)
+            break
+    if made.is_none() then made = builtin(name)
+
+    val ins = made match
+        Some(ins) -> ins
+        None ->
+            var known = builtin_names()
+            for i in 0..<r.registered.len do known.push(r.registered[i].name)
+            val d = error(at, s"there is no instrument called `$name`")
+            return Err(nearest_name(name, known) match
+                Some(near) -> d.with_label(s"did you mean `$near`?")
+                None -> d.with_note("the built-in instruments are sine, organ, clarinet, bell and pluck"))
+
+    if r.instruments.len() == MAX_INSTRUMENTS then
+        return Err(error(at, s"a score holds at most $MAX_INSTRUMENTS instruments, and this is one more"))
+
+    r.instruments.push(ins)
+    r.names.push(name)
+    Ok(u16(r.instruments.len() - 1))
+end resolve
+
+// -- directives -----------------------------------------------------------------------------------
+
+// `[name arguments]`: a change to the state the notes after it inherit.
+private directive(r: *Reader, st: *State) -> Result[unit, Diagnostic]
+    r.s.at += 1
+    trivia(r)
+
+    val (name, at) = word(r, "a directive's name, such as `tempo` or `key`")?
+
+    name match
+        "tempo" ->
+            val (v, span) = number(r)?
+            if v <= 0.0 then return Err(error(span, "a tempo is a number of quarter notes a minute, above zero"))
+            st.tempo = v
+        "volume" ->
+            val (v, span) = number(r)?
+            if v < 0.0 || v > 1.0 then return Err(error(span, "a volume is from 0 to 1"))
+            st.volume = v
+        "transpose" ->
+            st.transpose = whole(r, -127, 127, "a transposition is a whole number of semitones")?
+        "octave" ->
+            st.octave = whole(r, 0, 9, "an octave is a whole number from 0 to 9; 4 is the one middle C begins")?
+        "key" -> st.fifths = signature(r)?
+        "temperament" ->
+            val (t, span) = word(r, "a temperament, `equal` or `werckmeister`")?
+            st.temperament = t match
+                "equal" -> Equal
+                "werckmeister" -> Werckmeister
+                else return Err(error(span, s"there is no temperament called `$t`")
+                    .with_note("the temperaments are `equal` and `werckmeister`"))
+        "instrument" ->
+            val (n, span) = word(r, "an instrument's name")?
+            st.instrument = Some(resolve(r, n, span)?)
+        else
+            var known: Buf[string] = buf()
+            for k in ["tempo", "key", "temperament", "transpose", "volume", "instrument", "octave"] do known.push(k)
+            val d = error(at, s"there is no directive called `$name`")
+            return Err(nearest_name(name, known) match
+                Some(near) -> d.with_label(s"did you mean `$near`?")
+                None -> d.with_note("the directives are tempo, key, temperament, transpose, volume, instrument and octave"))
+
+    trivia(r)
+    if !r.s.accept(u8(']')) then
+        val here = Span(r.s.offset, r.s.offset + 1)
+        return Err(expected(here, "`]` to close the directive", found(r, here)))
+    Ok(())
+end directive
+
+// A name -- a letter, then letters, digits and underscores -- after any space.
+private word(r: *Reader, want: string) -> Result[(string, Span), Diagnostic]
+    trivia(r)
+    r.s.read_ident(is_ident_start, is_ident_cont) match
+        Some(span) -> Ok((str_cast(r.s.src[span.start..<span.end]), span))
+        None ->
+            val here = Span(r.s.offset, r.s.offset + 1)
+            Err(expected(here, want, found(r, here)))
+end word
+
+// A number, perhaps negative, after any space.
+private number(r: *Reader) -> Result[(real, Span), Diagnostic]
+    trivia(r)
+    val from = r.s.offset
+    val negative = r.s.accept(u8('-'))
+
+    val v = read_number(&r.s) match
+        Ok(Int(v)) -> real(v)
+        Ok(Real(v)) -> v
+        Err(e) -> return Err(lit_error(r, e, "expected a number"))
+
+    Ok((if negative then -v else v, Span(from, r.s.offset)))
+end number
+
+// A whole number from `lo` to `hi`.
+private whole(r: *Reader, lo: int, hi: int, want: string) -> Result[int, Diagnostic]
+    val (v, span) = number(r)?
+    if v != v.floor() || v < real(lo) || v > real(hi) then return Err(error(span, want))
+    Ok(int(v))
+
+// `g major`, `fs minor`, `bf major`: a tonic and a mode, read into a count of sharps or flats.
+private signature(r: *Reader) -> Result[int, Diagnostic]
+    val (tonic, at) = word(r, "a key's tonic, such as `g` or `bf`")?
+    val b = tonic.bytes
+    val letter = b[0]
+    val shape = letter >= u8('a') && letter <= u8('g') && (b.len == 1 || (b.len == 2 && (b[1] == u8('s') || b[1] == u8('f'))))
+    if !shape then
+        return Err(error(at, s"`$tonic` is not a tonic").with_note("a tonic is a letter `a` to `g`, perhaps with `s` (sharp) or `f` (flat)"))
+    val accidental = if b.len == 1 then 0 else if b[1] == u8('s') then 1 else -1
+
+    val (mode, mode_at) = word(r, "a mode, `major` or `minor`")?
+    val minor = mode match
+        "major" -> false
+        "minor" -> true
+        else return Err(error(mode_at, s"`$mode` is not a mode; a key is `major` or `minor`"))
+
+    val fifths = key_fifths(letter, accidental, minor)
+    if fifths > 7 || fifths < -7 then
+        val n = if fifths > 0 then fifths else -fifths
+        val kind = if fifths > 0 then "sharps" else "flats"
+        return Err(error(Span(at.start, mode_at.end), s"`$tonic $mode` would need $n $kind; a key signature has at most seven")
+            .with_note("the same music is written in the enharmonic key, which needs fewer"))
+    Ok(fifths)
+end signature

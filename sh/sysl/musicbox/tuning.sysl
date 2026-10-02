@@ -1,0 +1,69 @@
+module sh.sysl.musicbox
+
+import sysl.math.Float
+
+// Pitch names to frequencies: the seven letters, the key signature that sharpens or flattens them,
+// and the temperament that turns a key number into hertz.
+//
+// Nothing here is a table built at start-up. A key signature is one number -- how many sharps (above
+// zero) or flats (below it) -- and which letters it alters follows from the order sharps are added
+// in, so the thirty signatures are arithmetic rather than thirty rows. The one real table, the
+// Werckmeister ratios, is a literal inside the function that reads it.
+
+// How a key number becomes hertz.
+enum Temperament
+    // Twelve equal semitones, A4 at 440 Hz.
+    Equal
+
+    // Andreas Werckmeister's "correct temperament No. 1" (1691), usually called Werckmeister III:
+    // four fifths narrowed by a quarter of the Pythagorean comma, so the keys near C are purer than
+    // equal temperament and the remote ones are rougher. C4 is where equal temperament puts it.
+    Werckmeister
+end Temperament
+
+// The semitone above C of a letter, `c` through `b`.
+letter_semitone(letter: u8) -> int =
+    if letter == u8('c') then 0
+    else if letter == u8('d') then 2
+    else if letter == u8('e') then 4
+    else if letter == u8('f') then 5
+    else if letter == u8('g') then 7
+    else if letter == u8('a') then 9
+    else 11
+end letter_semitone
+
+// Where a letter's major key sits on the circle of fifths: C is 0, G one sharp, F one flat.
+private fifths_of(letter: u8) -> int =
+    if letter == u8('c') then 0
+    else if letter == u8('d') then 2
+    else if letter == u8('e') then 4
+    else if letter == u8('f') then -1
+    else if letter == u8('g') then 1
+    else if letter == u8('a') then 3
+    else 5
+end fifths_of
+
+// The signature of the key whose tonic is `letter` raised by `accidental` semitones, as a count of
+// sharps (positive) or flats (negative). A minor key carries its relative major's signature, which
+// is three fifths flatwards of its own tonic's major. Anything outside -7..7 is a key no signature
+// writes -- G-sharp major would need eight sharps -- and the caller refuses it.
+key_fifths(letter: u8, accidental: int, minor: bool) -> int =
+    fifths_of(letter) + 7 * accidental - (if minor then 3 else 0)
+
+// What a signature of `fifths` does to `letter`: +1, -1 or 0. Sharps are added in the order
+// F C G D A E B and flats in the reverse, so a letter is sharpened once the count passes its place.
+key_accidental(fifths: int, letter: u8) -> int
+    val place = fifths_of(letter) + 1
+    if fifths > 0 && fifths > place then return 1
+    if fifths < 0 && -fifths > 6 - place then return -1
+    0
+
+// The frequency of MIDI key `key` in a temperament.
+frequency(key: int, t: Temperament) -> real
+    if t == Equal then return pitch(real(key))
+
+    val ratios: [12]real = [1.0, 1.0535686, 1.1174011, 1.1852459, 1.2533331, 1.3333333, 1.40625,
+                            1.4953488, 1.5802469, 1.6735537, 1.7777778, 1.8877551]
+
+    pitch(60.0) * ratios[usize(key % 12)] * 2.0.pow(real(key / 12 - 5))
+end frequency

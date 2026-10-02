@@ -1,0 +1,41 @@
+module sh.sysl.musicbox
+
+import sysl.buf.{Buf, buf}
+
+// The instruments a score's text may name without the program supplying any.
+//
+// They are built when they are asked for rather than kept in module storage, so naming one costs a
+// few float stores and a board build never meets an initializer.
+
+// An instrument a program offers the notation under a name. A registered name is looked up before
+// the built-in ones, so a program may replace `organ` with its own.
+struct Named
+    name: string
+    instrument: Instrument
+
+// The built-in instrument called `name`, if there is one.
+builtin(name: string) -> Option[Instrument]
+    val made = name match
+        "sine" -> instrument([Partial(1.0, 1.0)], adsr(0.01, 0.05, 0.9, 0.1))
+        "organ" -> instrument([Partial(1.0, 1.0), Partial(2.0, 0.5), Partial(3.0, 0.25), Partial(4.0, 0.125)],
+                              adsr(0.01, 0.1, 0.8, 0.08))
+        "clarinet" -> instrument([Partial(1.0, 1.0), Partial(3.0, 0.4), Partial(5.0, 0.2), Partial(7.0, 0.1)],
+                                 adsr(0.03, 0.1, 0.85, 0.1))
+        "bell" -> instrument([Partial(1.0, 1.0), Partial(2.76, 0.5), Partial(5.4, 0.25), Partial(8.93, 0.12)],
+                             pluck(2.5, 0.5))
+        "pluck" -> instrument([Partial(1.0, 1.0), Partial(2.0, 0.3), Partial(3.0, 0.1)], pluck(1.0, 0.1))
+        else return None
+
+    made.ok()
+end builtin
+
+// The names `builtin` answers to, for a suggestion when a score misspells one.
+builtin_names() -> Buf[string]
+    var names: Buf[string] = buf()
+    names.push("sine")
+    names.push("organ")
+    names.push("clarinet")
+    names.push("bell")
+    names.push("pluck")
+    names
+end builtin_names

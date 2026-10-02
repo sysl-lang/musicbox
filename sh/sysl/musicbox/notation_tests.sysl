@@ -1,0 +1,386 @@
+module sh.sysl.musicbox
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_text
+import sysl.text.split
+import sh.sysl.parsing.{Diagnostic, Loc, source_of}
+
+// The text notation, read note by note: what each piece of syntax makes of a note's start, length,
+// release and frequency, then every way a text is refused and where the refusal points.
+
+private notes_of(text: string) -> []const Note = parse(text).unwrap().note_list()
+
+// The Q16.16 frequency of MIDI key `k` in equal temperament, which is what a note stores.
+private key_hz(k: int) -> u32 = u32(pitch(real(k)) * 65536.0 + 0.5)
+
+private hz(f: real) -> u32 = u32(f * 65536.0 + 0.5)
+
+private us(seconds: real) -> u64 = u64(seconds * 1000000.0 + 0.5)
+
+// The keys of a text's notes, in order, as equal-tempered frequencies.
+private assert_keys(text: string, keys: []const int)
+    val ns = notes_of(text)
+    assert_eq(ns.len, keys.len, "how many notes `{text}` makes")
+    for i in 0..<keys.len
+        assert_eq(ns[i].frequency, key_hz(keys[i]), "note {i} of `{text}`")
+
+private assert_starts(text: string, starts: []const real)
+    val ns = notes_of(text)
+    assert_eq(ns.len, starts.len, "how many notes `{text}` makes")
+    for i in 0..<starts.len
+        assert_eq(ns[i].start, us(starts[i]), "the start of note {i} of `{text}`")
+
+private failure(text: string) -> Diagnostic = parse(text) match
+    Ok(_) -> panic(s"`$text` was not refused")
+    Err(d) -> d
+
+// Where a refusal points, as line and column.
+private place(text: string, d: Diagnostic) -> Loc = source_of("score", text).locate(d.span.start)
+
+private assert_refused(text: string, message: string, line: usize, col: usize)
+    val d = failure(text)
+    assert_eq(d.message, message, "the refusal of `{text}`")
+    assert_eq(place(text, d), Loc(line, col), "where the refusal of `{text}` points")
+
+@test("the seven letters are the white keys up from middle C, a quarter note apart at 120")
+letters()
+    assert_keys("c d e f g a b", [60, 62, 64, 65, 67, 69, 71])
+    assert_starts("c d e f g a b", [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
+    val ns = notes_of("c d")
+    assert_eq(ns[0].length, 500000)
+    assert_eq(ns[1].length, 500000)
+
+@test("a rest takes its time and makes no note")
+rests()
+    assert_keys("c r d r2 e", [60, 62, 64])
+    assert_starts("c r d r2 e", [0.0, 1.0, 2.5])
+
+@test("s sharpens, f flattens, both repeat, and n is a natural")
+accidentals()
+    assert_keys("cs df ess bff cn css", [61, 61, 66, 69, 60, 62])
+
+@test("each ' raises a note an octave and each , lowers one; [octave] moves the unmarked c")
+octave_marks()
+    assert_keys("c' c'' c, c,, b, bs,", [72, 84, 48, 36, 59, 60])
+    assert_keys("[octave 5] c a, [octave 0] c", [72, 69, 12])
+
+@test("a duration is sticky: a note without one has the last one written")
+sticky_duration()
+    val ns = notes_of("c2 d e8 f g1 a")
+    assert_eq(ns[0].length, 1000000)
+    assert_eq(ns[1].length, 1000000)
+    assert_eq(ns[2].length, 250000)
+    assert_eq(ns[3].length, 250000)
+    assert_eq(ns[4].length, 2000000)
+    assert_eq(ns[5].length, 2000000)
+    assert_starts("c2 d e8 f g1 a", [0.0, 1.0, 2.0, 2.25, 2.5, 4.5])
+    assert_eq(notes_of("c16 d32 e64")[2].length, 31250)
+end sticky_duration
+
+@test("a dot adds half the length, two add three quarters, and dots are not sticky")
+dots()
+    val ns = notes_of("c4. d4.. e")
+    assert_eq(ns[0].length, 750000)
+    assert_eq(ns[1].length, 875000)
+    assert_eq(ns[2].length, 500000)
+    assert_starts("c4. d4.. e", [0.0, 0.75, 1.625])
+
+@test("a tuplet fits n notes in the time of m, by default the power of two below n")
+tuplets()
+    val tri = notes_of("{3 c8 d e} f4")
+    for i in 0..<3 do assert_eq(tri[i].length, 166667)
+    assert_eq(tri[1].start, 166667)
+    assert_eq(tri[3].start, 500000, "after the triplet the beat is where it would have been")
+
+    val quint = notes_of("{5 c16 d e f g} a4")
+    assert_eq(quint[0].length, 100000)
+    assert_eq(quint[5].start, 500000)
+
+    val explicit = notes_of("{3:4 c4 d e} f")
+    assert_eq(explicit[0].length, 666667)
+    assert_eq(explicit[3].start, 2000000)
+
+    val nested = notes_of("{3 c8 {3 d16 e f} g8} a4")
+    assert_eq(nested[1].length, 55556, "a triplet inside a triplet is two thirds of two thirds")
+    assert_eq(nested[5].start, 500000)
+end tuplets
+
+@test("a chord sounds its pitches together and takes one duration")
+chords()
+    val ns = notes_of("<c e g>2 <d f a>4. b")
+    assert_eq(ns.len, 7)
+    assert_keys("<c e g>2 <d f a>4. b", [60, 64, 67, 62, 65, 69, 71])
+    for i in 0..<3
+        assert_eq(ns[i].start, 0)
+        assert_eq(ns[i].length, 1000000)
+    for i in 3..<6
+        assert_eq(ns[i].start, 1000000)
+        assert_eq(ns[i].length, 750000)
+    assert_eq(ns[6].start, 1750000)
+    assert_eq(ns[6].length, 500000, "the dot was not sticky, and neither is a chord")
+    assert_keys("<c' e,, gs>", [72, 40, 68])
+end chords
+
+@test("a key signature sharpens and flattens the letters it names, all thirty of them")
+key_signatures()
+    assert_keys("[key g major] f c", [66, 60])
+    assert_keys("[key bf major] b e a", [70, 63, 69])
+    assert_keys("[key d minor] b c", [70, 60])
+    assert_keys("[key cs major] e b", [65, 72])
+    assert_keys("[key cf major] c f", [59, 64])
+    assert_keys("[key gs minor] f c d", [66, 61, 63])
+    assert_keys("[key af minor] c f", [59, 64])
+    assert_keys("[key e major] [key c major] f", [65])
+
+    // Every signature, from its count of sharps or flats, read by the letters it alters.
+    val majors = ["cf", "gf", "df", "af", "ef", "bf", "f", "c", "g", "d", "a", "e", "b", "fs", "cs"]
+    val minors = ["af", "ef", "bf", "f", "c", "g", "d", "a", "e", "b", "fs", "cs", "gs", "ds", "as"]
+    for i in 0..<15
+        val fifths = int(i) - 7
+        for mode in 0..<2
+            val tonic = if mode == 0 then majors[i] else minors[i]
+            val name = if mode == 0 then "major" else "minor"
+            val ns = notes_of(s"[key $tonic $name] f c g d a e b")
+            var altered = 0
+            for j in 0..<7
+                val natural = key_hz([65, 60, 67, 62, 69, 64, 71][j])
+                if ns[j].frequency != natural then altered += 1
+            val count = if fifths < 0 then -fifths else fifths
+            assert_eq(altered, count, "`{tonic} {name}` alters {count} letters")
+end key_signatures
+
+@test("a written accidental replaces the key's, so n is a natural against the key")
+natural_overrides_key()
+    assert_keys("[key d major] f fn cn c", [66, 65, 60, 61])
+    assert_keys("[key g major] fs ff", [66, 64])
+    assert_keys("[key bf major] bn bs", [71, 72])
+
+@test("Werckmeister III keeps C where equal temperament has it and moves the other keys")
+temperament()
+    val ns = notes_of("[temperament werckmeister] c e a c' [temperament equal] e")
+    assert_eq(ns[0].frequency, key_hz(60))
+    assert_eq(ns[1].frequency, hz(pitch(60.0) * 1.2533331))
+    assert_eq(ns[2].frequency, hz(pitch(60.0) * 1.6735537))
+    assert(ns[2].frequency < key_hz(69), "Werckmeister's A is below 440")
+    assert_eq(ns[3].frequency, hz(pitch(60.0) * 2.0))
+    assert_eq(ns[4].frequency, key_hz(64), "and equal temperament comes back")
+end temperament
+
+@test("a transposition moves every pitch after it by semitones")
+transposition()
+    assert_keys("[transpose 2] c e", [62, 66])
+    assert_keys("[transpose -12] a", [57])
+    assert_eq(notes_of("[transpose -12] a")[0].frequency, hz(220.0))
+    assert_keys("[key g major] [transpose 1] f", [67])
+
+@test("the tempo is quarter notes a minute and changes the times of every note after it")
+tempo()
+    assert_starts("[tempo 60] c d", [0.0, 1.0])
+    assert_eq(notes_of("[tempo 60] c")[0].length, 1000000)
+    assert_starts("c [tempo 240] d e", [0.0, 0.5, 0.75])
+    assert_eq(notes_of("c [tempo 240] d")[1].length, 250000)
+    assert_eq(notes_of("[tempo 90.5] c1")[0].length, u32(240.0 / 90.5 * 1000000.0 + 0.5))
+
+@test("the volume is each note's velocity")
+volume()
+    val ns = notes_of("c [volume 0.25] d [volume 0] e")
+    assert_eq(ns[0].velocity, q31(1.0))
+    assert_eq(ns[1].velocity, q31(0.25))
+    assert_eq(ns[2].velocity, q31(0.0))
+
+@test("instruments are named, added to the score once each, and sine when none is named")
+instruments()
+    val plain = parse("c d").unwrap()
+    assert_eq(plain.instrument_list().len, 1)
+    assert_eq(plain.instrument_list()[0].partial_count(), 1)
+
+    val sc = parse("[instrument organ] c [instrument pluck] d [instrument organ] e").unwrap()
+    assert_eq(sc.instrument_list().len, 2)
+    assert_eq(sc.instrument_list()[0].partial_count(), 4)
+    assert_eq(sc.instrument_list()[1].partial_count(), 3)
+    val ns = sc.note_list()
+    assert_eq(ns[0].instrument, 0)
+    assert_eq(ns[1].instrument, 1)
+    assert_eq(ns[2].instrument, 0)
+
+    for name in ["sine", "organ", "clarinet", "bell", "pluck"]
+        assert(parse(s"[instrument $name] c").is_ok(), "`{name}` is built in")
+end instruments
+
+@test("a registered instrument is named like a built-in one, and is looked up first")
+registered()
+    val kazoo = instrument([Partial(1.0, 1.0), Partial(2.0, 0.5)], adsr(0.0, 0.0, 1.0, 0.1)).unwrap()
+    val own = parse_with("[instrument kazoo] c", [Named("kazoo", kazoo)]).unwrap()
+    assert_eq(own.instrument_list()[0].partial_count(), 2)
+
+    val replaced = parse_with("[instrument organ] c", [Named("organ", kazoo)]).unwrap()
+    assert_eq(replaced.instrument_list()[0].partial_count(), 2, "not the built-in organ's four")
+end registered
+
+@test("voices start together, merge into start order, and keep their directives to themselves")
+voices()
+    assert_keys("<< c2 d | e4 f g a >> b", [60, 64, 65, 62, 67, 69, 71])
+    assert_starts("<< c2 d | e4 f g a >> b", [0.0, 0.0, 0.5, 1.0, 1.0, 1.5, 2.0])
+
+    val ns = notes_of("[instrument organ] << [transpose 12] [instrument bell] c1 | c8 >> c")
+    assert_eq(ns[0].frequency, key_hz(72))
+    assert_eq(ns[0].instrument, 1)
+    assert_eq(ns[1].frequency, key_hz(60))
+    assert_eq(ns[1].instrument, 0)
+    assert_eq(ns[2].frequency, key_hz(60), "the transposition stayed in its voice")
+    assert_eq(ns[2].instrument, 0, "and so did the instrument")
+    assert_eq(ns[2].start, 2000000, "the music goes on after the longest voice")
+    assert_eq(ns[2].length, 500000, "with the duration in force before the `<<`")
+
+    assert_starts("<< c1 | << d2 | e4 f >> g2 >> a", [0.0, 0.0, 0.0, 0.5, 1.0, 2.0])
+    assert_starts("<< c | d | e | f >>", [0.0, 0.0, 0.0, 0.0])
+end voices
+
+@test("articulation is the release point: staccato half, tenuto all, plain nine tenths, legato past")
+articulation()
+    val ns = notes_of("c-. d-- e")
+    assert_eq(ns[0].hold, 250000)
+    assert_eq(ns[1].hold, 500000)
+    assert_eq(ns[2].hold, 450000)
+    for i in 0..<3 do assert_eq(ns[i].length, 500000, "articulation leaves the written length alone")
+    assert_starts("c-. d-- e", [0.0, 0.5, 1.0])
+
+    val slurred = notes_of("(c d e) f")
+    assert_eq(slurred[0].hold, 550000)
+    assert_eq(slurred[1].hold, 550000)
+    assert_eq(slurred[2].hold, 450000, "the last note of a slur is let go as written")
+    assert_eq(slurred[3].hold, 450000)
+
+    val mixed = notes_of("(c d-. <e g>) a2.-. b4.--")
+    assert_eq(mixed[0].hold, 550000)
+    assert_eq(mixed[1].hold, 250000, "a note's own articulation wins inside a slur")
+    assert_eq(mixed[2].hold, 450000)
+    assert_eq(mixed[3].hold, 450000, "every note of the chord ending the slur")
+    assert_eq(mixed[4].hold, 750000)
+    assert_eq(mixed[5].hold, 750000)
+
+    val nested = notes_of("(c (d e) f)")
+    assert_eq(nested[2].hold, 550000, "an inner slur's last note still leads into the outer's next")
+    assert_eq(nested[3].hold, 450000)
+end articulation
+
+@test("% comments run to the end of the line, and lines are whitespace")
+comments()
+    assert_keys("c % d e\n  f\n% g\na", [60, 65, 69])
+
+@test("each refusal says what was wrong and points at the line and column")
+refusals()
+    assert_refused("c4 d3 e", "a duration is 1, 2, 4, 8, 16, 32 or 64", 1, 5)
+    assert_refused("c d\n  x", "expected a note, a rest, a chord or a directive", 2, 3)
+    assert_refused("c h", "expected a note, a rest, a chord or a directive", 1, 3)
+    assert_refused("[tempo 0] c", "a tempo is a number of quarter notes a minute, above zero", 1, 8)
+    assert_refused("[tempo] c", "expected a number", 1, 7)
+    assert_refused("[tempi 90]", "there is no directive called `tempi`", 1, 2)
+    assert_refused("[]", "expected a directive's name, such as `tempo` or `key`", 1, 2)
+    assert_refused("c\n[instrument orgn] c", "there is no instrument called `orgn`", 2, 13)
+    assert_refused("[key gs major]", "`gs major` would need 8 sharps; a key signature has at most seven", 1, 6)
+    assert_refused("[key ff minor]", "`ff minor` would need 11 flats; a key signature has at most seven", 1, 6)
+    assert_refused("[key h major]", "`h` is not a tonic", 1, 6)
+    assert_refused("[key g dorian]", "`dorian` is not a mode; a key is `major` or `minor`", 1, 8)
+    assert_refused("[temperament mean]", "there is no temperament called `mean`", 1, 14)
+    assert_refused("[transpose 1.5]", "a transposition is a whole number of semitones", 1, 12)
+    assert_refused("[octave 10]", "an octave is a whole number from 0 to 9; 4 is the one middle C begins", 1, 9)
+    assert_refused("[volume 2]", "a volume is from 0 to 1", 1, 9)
+    assert_refused("[tempo 90 c", "expected `]` to close the directive", 1, 11)
+    assert_refused("c <e g", "this chord is never closed", 1, 3)
+    assert_refused("c <>", "a chord holds at least one note", 1, 3)
+    assert_refused("<c <d>>", "expected a pitch, a letter `a` to `g`", 1, 4)
+    assert_refused("<< c | d", "this `<<` is never closed", 1, 1)
+    assert_refused("c | d", "there is no `<<` open here to separate or close", 1, 3)
+    assert_refused("c >> d", "there is no `<<` open here to separate or close", 1, 3)
+    assert_refused("c\n  (d e", "this `(` is never closed", 2, 3)
+    assert_refused("c )", "there is no `(` open here to close", 1, 3)
+    assert_refused("{3 c d e", "this `{` is never closed", 1, 1)
+    assert_refused("c }", "there is no `{` open here to close", 1, 3)
+    assert_refused("{c d}", "a tuplet opens with how many notes it holds, as in `{3 c8 d e}`", 1, 2)
+    assert_refused("{3: c d}", "a tuplet's `:` is followed by the notes it takes the time of, as in `{3:2`", 1, 4)
+    assert_refused("{1 c}", "a tuplet holds at least two notes", 1, 1)
+    assert_refused("c d-x", "an articulation is `-.` for staccato or `--` for tenuto", 1, 4)
+    assert_refused("c c'''''''", "this pitch is outside the range of MIDI keys 0 to 127", 1, 3)
+    assert_refused("[transpose -127] cf", "this pitch is outside the range of MIDI keys 0 to 127", 1, 18)
+end refusals
+
+@test("a refusal suggests the nearest name, and lists the choices when nothing is near")
+suggestions()
+    assert_eq(failure("[tempi 90]").label, "did you mean `tempo`?")
+    assert_eq(failure("[instrument orgn]").label, "did you mean `organ`?")
+    assert_eq(failure("[instrument xylophone]").note,
+              "the built-in instruments are sine, organ, clarinet, bell and pluck")
+
+@test("more instruments than a score holds is refused at the one too many")
+too_many_instruments()
+    val ins = instrument([Partial(1.0, 1.0)], pluck(0.5, 0.1)).unwrap()
+    var named: Buf[Named] = buf()
+    var text = ""
+    for i in 0..<17
+        named.push(Named(s"i$i", ins))
+        text = s"$text[instrument i$i] c "
+    val d = parse_with(text, named.view()) match
+        Ok(_) -> panic("seventeen instruments were accepted")
+        Err(d) -> d
+    assert_eq(d.message, "a score holds at most 16 instruments, and this is one more")
+    assert_eq(source_of("score", text).text(d.span), "i16".bytes)
+end too_many_instruments
+
+@test("explain quotes the line and puts a caret under the place")
+explain_renders()
+    val text = "c4 d e\nf g3 a"
+    val shown = explain(text, failure(text))
+    assert_eq(shown, "error: a duration is 1, 2, 4, 8, 16, 32 or 64\n --> score:2:4\n  |\n2 | f g3 a\n  |    ^ found `3`\n")
+
+@test("every musicbox block in the README parses")
+readme_examples()
+    val text = read_text("README.md").unwrap()
+    val lines = split(text, "\n")
+    var inside = false
+    var block = ""
+    var blocks = 0
+    for line in lines
+        if inside then
+            if line == "```" then
+                inside = false
+                blocks += 1
+                assert(parse(block).is_ok(), "the README block\n{block}\nparses")
+            else
+                block = s"$block$line\n"
+        else if line == "```musicbox" then
+            inside = true
+            block = ""
+    assert_eq(blocks, 6)
+end readme_examples
+
+@test("a parsed score renders at the pitch it was written at")
+end_to_end()
+    val equal = parse("[tempo 60] a").unwrap()
+    assert_eq(crossings(equal), 220, "half a second of A4")
+
+    val high = parse("[tempo 60] [key g major] [octave 5] f").unwrap()
+    val n = crossings(high)
+    assert(n == 369 || n == 370, "half a second of F#5, 739.99 Hz, crossed {n} times")
+
+    val tuned = parse("[tempo 60] [temperament werckmeister] a").unwrap()
+    val w = crossings(tuned)
+    assert(w == 218 || w == 219, "half a second of Werckmeister's A, 437.85 Hz, crossed {w} times")
+end end_to_end
+
+// Upward zero crossings in the middle half second of a score rendered at 48 kHz.
+private crossings(sc: Score) -> usize
+    var s = synth(sc, 48000).unwrap()
+    var out: Buf[i16] = buf()
+    var block: [256]i16
+    loop
+        val more = s.render(block[..])
+        out.extend(block[..])
+        if !more then break
+
+    var n: usize = 0
+    for i in 12001usize..<36000
+        if out[i - 1] < 0 && out[i] >= 0 then n += 1
+    n
+end crossings

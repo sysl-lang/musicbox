@@ -72,6 +72,138 @@ held, and over `release` once it is let go.
 
 Every release is at least 20 ms: anything faster is a click whatever the instrument meant.
 
+## Writing music as text
+
+`parse(text) -> Result[Score, Diagnostic]` reads a score from a LilyPond-like notation. Everything the
+music says about itself -- tempo, key, temperament, transposition, volume, instrument and voices -- is
+written in the text, so the text is the whole of the input:
+
+```musicbox
+[tempo 96] [key g major] [instrument organ]
+<< d'4 e' f' g'2 | <g, b, d>1 >>
+```
+
+```sysl
+import sh.sysl.musicbox.*
+import sysl.fs.write_bytes
+
+val song = parse("[key g major] << d'4 e' f' g'2 | <g, b, d>1 >>").unwrap()
+write_bytes("song.wav", render_wav(song, 44100).unwrap().view()).unwrap()
+```
+
+Every block marked `musicbox` in this README is parsed by the test suite.
+
+### Notes
+
+A note is a **letter**, then its **accidentals**, then its **octave marks**, then its **duration**,
+**dots** and **articulation** -- all but the letter optional, and nothing between them.
+
+```musicbox
+c d e f g a b c'
+```
+
+- **Letters** `c d e f g a b` name the white keys from middle C up; `r` is a rest.
+- **Accidentals**: `s` sharpens and `f` flattens, repeatable (`css` is a double sharp, `bff` a double
+  flat); `n` is a natural. A written accidental *replaces* the key signature's, so `fn` in G major is
+  F natural and `f` alone is F sharp.
+- **Octave marks**: each `'` raises the note an octave and each `,` lowers it. An unmarked `c` is
+  middle C (MIDI 60) until `[octave n]` moves it.
+- **Durations** `1 2 4 8 16 32 64` are whole, half, quarter... notes. A duration is **sticky**: a note
+  without one has the last one written, and the first note's is a quarter.
+- **Dots**: `.` adds half the duration, `..` three quarters. Dots are not sticky.
+- **Articulation**: `-.` is staccato (the note is let go at half its length), `--` tenuto (held for all
+  of it). A plain note is held for nine tenths, the way a player separates notes.
+
+```musicbox
+cs df en bff c4 d e8 f g2. r4 c-. d-- e
+```
+
+### Groups
+
+- **A chord** `<c e g>2` sounds its pitches together and takes its duration, dots and articulation
+  after the `>`.
+- **A slur** `( ... )` plays legato: each note in it is held a tenth past its end so the next starts
+  under it, and the last note is let go as written. A note's own `-.` or `--` still wins.
+- **A tuplet** `{n:m ... }` fits `n` notes in the time of `m`. Without `:m` it is the largest power of
+  two below `n`: `{3` is a triplet in the time of two, `{5` a quintuplet in the time of four.
+
+```musicbox
+<c e g>2 <b, d g> (c4 d e f) g1 {3 c8 d e} f4 {5:4 g16 a b c' d'}
+```
+
+### Voices
+
+`<< one | two | ... >>` sounds its voices at once, each starting where the `<<` stands. The music after
+the `>>` starts when the longest voice ends. **Each voice begins with a copy of everything in force at
+the `<<`** -- the key, the instrument, the sticky duration -- and a directive inside a voice is that
+voice's alone, so after the `>>` the music goes on as it was before the `<<`. Voices nest.
+
+```musicbox
+% a melody over a bass line
+[instrument clarinet]
+<< e'4 d' c' d' e' e' e'2
+ | [instrument pluck] [octave 3] c1 g >>
+```
+
+### Directives
+
+A directive is `[name arguments]`, and changes what the notes after it inherit.
+
+| directive | argument | default |
+|---|---|---|
+| `[tempo 96]` | quarter notes a minute, above zero | 120 |
+| `[key g major]` | a tonic (`c`, `fs`, `bf`...) and `major` or `minor`; all 30 signatures | `c major` |
+| `[temperament werckmeister]` | `equal` or `werckmeister` (Werckmeister III, C4 where equal puts it) | `equal` |
+| `[transpose -2]` | semitones, -127 to 127 | 0 |
+| `[volume 0.6]` | a note's velocity, 0 to 1 | 1 |
+| `[instrument bell]` | an instrument's name | `sine` |
+| `[octave 5]` | the octave an unmarked `c` starts, 0 to 9 | 4 |
+
+```musicbox
+[tempo 72] [key ef major] [temperament werckmeister] [transpose -2] [volume 0.6]
+[instrument bell] [octave 5] e g b e'2
+```
+
+The built-in instruments are `sine`, `organ` (four harmonics), `clarinet` (odd harmonics), `bell`
+(inharmonic partials, plucked) and `pluck`. A program offers its own with
+`parse_with(text, [Named("kazoo", kazoo)])`; a registered name is looked up first, so it may replace a
+built-in one. A score uses at most 16 instruments.
+
+`%` starts a comment that runs to the end of the line.
+
+### The grammar
+
+```
+score     = { item } ;
+item      = directive | voices | slur | tuplet | event ;
+directive = "[" name { argument } "]" ;
+voices    = "<<" { item } { "|" { item } } ">>" ;
+slur      = "(" { item } ")" ;
+tuplet    = "{" count [ ":" count ] { item } "}" ;
+event     = ( pitch | "r" | "<" { pitch } ">" ) [ duration ] { "." } [ "-." | "--" ] ;
+pitch     = letter [ "n" | { "s" | "f" } ] { "'" | "," } ;
+letter    = "a" | "b" | "c" | "d" | "e" | "f" | "g" ;
+duration  = "1" | "2" | "4" | "8" | "16" | "32" | "64" ;
+```
+
+Whitespace and comments separate items and may not split a note.
+
+### Errors
+
+A mistake is a `Diagnostic` from `sh.sysl.parsing` whose span indexes the text; `explain(text, d)`
+renders it the way the sysl compiler prints its own:
+
+```
+error: a duration is 1, 2, 4, 8, 16, 32 or 64
+ --> score:1:5
+  |
+1 | c4 d3 e
+  |     ^ found `3`
+```
+
+A misspelt directive or instrument is answered with the nearest name (`did you mean `tempo`?`), a
+group left open points at where it was opened, and a key needing eight sharps says so.
+
 ## Running on a board
 
 `requires {}` is exact, and the package keeps no module storage an initializer would have to fill --
@@ -84,8 +216,12 @@ sysl build-c <probe dir> --target thumbv6m-freestanding --lib <this repo>
 ```
 
 Both build, and the disassembly of `Synth.render` has no floating-point instruction or call in it.
-The only heap user is `render_wav`, which grows a buffer for a whole file; `wav_header` writes the
-44-byte header into storage the caller supplies.
+The heap users are `render_wav`, which grows a buffer for a whole file (`wav_header` writes the 44-byte
+header into storage the caller supplies), and `parse`, which grows the score's notes and reads its
+numbers through `sh.sysl.parsing`. A probe calling `parse` builds for both targets too; linking it
+needs what a libc supplies -- `malloc` and `free`, `strtod` for a directive's number, `pow` for a
+frequency -- so it runs on a board with newlib (the Pico SDK, Zephyr, FreeRTOS), and a bare one plays
+scores built with `note` and `score` instead.
 
 ## Testing
 
