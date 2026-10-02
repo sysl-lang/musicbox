@@ -1,0 +1,88 @@
+module sh.sysl.musicbox
+
+// An instrument is plain data: a handful of sine partials and an envelope.
+//
+// Additive synthesis is the whole palette. A partial is a multiple of the note's frequency and a
+// share of its loudness, so an organ is a few integer ratios, a bell a few inharmonic ones, and a
+// pure tone a single `Partial(1.0, 1.0)`. Every number here is a float in natural units -- seconds,
+// ratios, levels from 0 to 1 -- because none of it is read while rendering: a `Synth` converts it to
+// fixed point once, at the sample rate it was built for.
+
+// The most partials an instrument may have. The voice pool stores each voice's oscillators inline,
+// so this bounds the memory of the pool rather than being a property of the synthesis.
+const MAX_PARTIALS: usize = 8
+
+// The target ratio an envelope's exponential segments aim past, as in an analog RC envelope: a
+// segment heads for a point this far beyond where it is going, and arrives in the time it was given
+// rather than approaching for ever. 0.001 is -60 dB, the curve of a classic analog release; a smaller
+// ratio is a straighter, more percussive line and a larger one a rounder, more pad-like one.
+const DEFAULT_CURVE: real = 0.001
+
+// A sine at `ratio` times the note's frequency, contributing `amplitude` to its loudness.
+struct Partial
+    ratio: real
+    amplitude: real
+
+// How a note's loudness moves over its life. Times are in seconds and levels from 0 to 1.
+enum Envelope
+    // A linear rise to full level over `attack`, an exponential fall to `sustain` over `decay`, held
+    // until the note is released, then an exponential fall to silence over `release`. `curve` is the
+    // target ratio of the two exponential segments. A release time is the fall from full level, so a
+    // note let go below it -- from its sustain, or partway up its attack -- is silent sooner.
+    Adsr(attack: real, decay: real, sustain: real, release: real, curve: real)
+
+    // A string or a struck bar: full level at once, falling by 60 dB over `decay` whether or not the
+    // note is still held, and over `release` once it is let go.
+    Pluck(decay: real, release: real)
+
+// An ADSR envelope with the default curve.
+adsr(attack: real, decay: real, sustain: real, release: real, curve: real = DEFAULT_CURVE) -> Envelope =
+    Adsr(attack, decay, sustain, release, curve)
+
+// A plucked envelope.
+pluck(decay: real, release: real) -> Envelope = Pluck(decay, release)
+
+// What a score, an instrument or a synth was refused for.
+enum MusicError derives Eq, Display
+    // An instrument was given more than `MAX_PARTIALS` partials.
+    TooManyPartials(count: usize)
+
+    // An instrument was given no partials, so every note it played would be silence.
+    NoPartials
+
+    // A score holds more than `MAX_INSTRUMENTS` instruments.
+    TooManyInstruments(count: usize)
+
+    // Note `index` names an instrument the score does not have.
+    NoSuchInstrument(index: usize)
+
+    // Note `index` starts before the note in front of it; a score is in order of start time.
+    OutOfOrder(index: usize)
+
+    // A sample rate of zero, which no device has.
+    NoSampleRate
+
+    // The rendered audio is longer than a WAV file can say.
+    TooLong
+
+struct Instrument
+    private partials: [MAX_PARTIALS]Partial
+    private count: usize
+    envelope: Envelope
+
+    // How many partials the instrument has.
+    partial_count(self) -> usize = self.count
+
+    // Its `i`th partial, in the order they were given.
+    partial(self, i: usize) -> Partial = self.partials[i]
+
+// An instrument from its partials and its envelope.
+instrument(partials: []const Partial, envelope: Envelope) -> Result[Instrument, MusicError]
+    if partials.len == 0 then return Err(NoPartials)
+    if partials.len > MAX_PARTIALS then return Err(TooManyPartials(partials.len))
+
+    var stored: [MAX_PARTIALS]Partial
+    for i in 0..<partials.len
+        stored[i] = partials[i]
+
+    Ok(Instrument(stored, partials.len, envelope))

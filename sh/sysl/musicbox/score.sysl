@@ -1,0 +1,67 @@
+module sh.sysl.musicbox
+
+import sysl.math.Float
+
+// A score: notes in order of start time, and the instruments they name.
+//
+// **It is immutable, and a `Synth` only reads it.** Playing a score changes nothing in it, so the same
+// score renders the same bytes every time, can be rewound and played again, and can be handed to two
+// synths at once. Everything that changes while a note sounds lives in the synth's voice pool, which
+// is sized by how many notes may sound at once rather than by how long the song is.
+//
+// Times are kept in microseconds rather than samples, so that a score means the same music at every
+// sample rate; the synth converts a note's times when the note begins, in integer arithmetic.
+
+// One note, as compact as it can be while still saying everything the renderer needs.
+//
+// `length` is the written duration and `hold` is when the release begins, and the two differ on
+// purpose: articulation is a release point that is not the written length. A staccato note is held
+// for half its length, a tenuto one for all of it, and a legato one past its end so that it overlaps
+// the next. The synth reads only `start` and `hold`; `length` is what a notation spaced the notes by.
+struct Note
+    start: u64          // microseconds from the beginning of the score
+    length: u32         // the written duration, in microseconds
+    hold: u32           // microseconds from `start` to the beginning of the release
+    frequency: u32      // hertz, in Q16.16
+    velocity: Q31       // the note's peak level, 0 to 1
+    instrument: u16     // an index into the score's instruments
+
+    // The same note, released `seconds` after it starts rather than at the end of its written length.
+    held(self, seconds: real) -> Note =
+        Note(self.start, self.length, micros(seconds), self.frequency, self.velocity, self.instrument)
+
+    // The frequency in hertz, as a float.
+    hertz(self) -> real = real(self.frequency) / 65536.0
+
+// A note `length` seconds long starting `at` seconds in, at `frequency` hertz, released when its
+// written length ends.
+note(at: real, length: real, frequency: real, velocity: real = 1.0, instrument: u16 = 0) -> Note =
+    Note(u64(at * 1000000.0 + 0.5), micros(length), micros(length), u32(frequency * 65536.0 + 0.5),
+         q31(velocity), instrument)
+
+// The frequency of a MIDI note number in equal temperament, with A4 -- note 69 -- at 440 Hz. A
+// fractional number is a pitch between two keys.
+pitch(midi: real) -> real = 440.0 * 2.0.pow((midi - 69.0) / 12.0)
+
+private micros(seconds: real) -> u32 = u32(seconds * 1000000.0 + 0.5)
+
+struct Score
+    private notes: []const Note
+    private instruments: []const Instrument
+
+    // The notes, in order of start time.
+    note_list(self) -> []const Note = self.notes
+
+    // The instruments the notes index.
+    instrument_list(self) -> []const Instrument = self.instruments
+
+// A score over notes and instruments the caller owns. Refused if a note starts before the one in
+// front of it or names an instrument that is not there.
+score(notes: []const Note, instruments: []const Instrument) -> Result[Score, MusicError]
+    if instruments.len > MAX_INSTRUMENTS then return Err(TooManyInstruments(instruments.len))
+
+    for i in 0..<notes.len
+        if usize(notes[i].instrument) >= instruments.len then return Err(NoSuchInstrument(i))
+        if i > 0 && notes[i].start < notes[i - 1].start then return Err(OutOfOrder(i))
+
+    Ok(Score(notes, instruments))
