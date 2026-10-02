@@ -1,0 +1,155 @@
+module sh.sysl.musicbox
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{Float, pi}
+import sysl.encoding.{get_u16_le, get_u32_le}
+
+// The parts underneath the renderer: fixed point, the sine table, scores and the WAV header. What a
+// rendered note sounds like is in `synth_tests.sysl`.
+
+private const FULL: i32 = 2147483647
+private const LOWEST: i32 = -2147483648
+
+@test("a float converts to the nearest Q31, saturating at both ends")
+q31_from_real()
+    assert_eq(q31(0.5).raw, 1073741824)
+    assert_eq(q31(-0.25).raw, -536870912)
+    assert_eq(q31(1.0).raw, FULL, "1.0 is one step past the largest value")
+    assert_eq(q31(7.0).raw, FULL)
+    assert_eq(q31(-1.0).raw, LOWEST)
+    assert_eq(q31(-7.0).raw, LOWEST)
+    assert(q31(0.6).as_real() > 0.5999999 && q31(0.6).as_real() < 0.6000001)
+
+@test("a product is the fraction of a fraction")
+q31_multiplies()
+    assert_eq(q31(0.5) * q31(0.5), q31(0.25))
+    assert_eq(q31(-0.5) * q31(0.5), q31(-0.25))
+    assert_eq(q31(0.75) * Q31(FULL), Q31(1610612735), "times nearly one is nearly unchanged")
+
+@test("arithmetic saturates where an i32 would wrap to the other sign")
+q31_saturates()
+    assert_eq(q31(0.75) + q31(0.75), Q31(FULL))
+    assert_eq(q31(-0.75) + q31(-0.75), Q31(LOWEST))
+    assert_eq(q31(-0.75) - q31(0.75), Q31(LOWEST))
+    assert_eq(q31(0.75) - q31(-0.75), Q31(FULL))
+    assert_eq(Q31(LOWEST) * Q31(LOWEST), Q31(FULL), "-1 times -1 is the one product past the range")
+    assert_eq(-Q31(LOWEST), Q31(FULL))
+    assert_eq(q31(0.25) + q31(0.5), q31(0.75), "and adds exactly inside it")
+
+@test("the sine table is what the script that printed it computes")
+sine_table_recomputes()
+    for i in 0usize..<1024
+        val want = i32(((2.0 * pi * real(i) / 1024.0).sin() * 2147483647.0).round())
+        assert_eq(sine_entry(i), want, "entry {i}")
+
+// The interpolation is what keeps a low note clean: reading the nearest entry instead is off by up to
+// half a step, 0.3% of full scale, and the bound here is a hundredth of that.
+@test("the sine between table entries is interpolated, not stepped")
+sine_interpolates()
+    var worst = 0.0
+    for k in 0..<65536
+        val phase = u32(k) * 65536 + 12345
+        val exact = 2.0 * pi * real(phase) / 4294967296.0
+        val err = (sine(phase).as_real() - exact.sin()).abs()
+        if err > worst then worst = err
+    assert(worst < 0.00001, "worst error {worst}")
+
+    val half = sine(5 * 4194304 + 2097152).raw
+    assert_eq(half, i32((i64(sine_entry(5)) + i64(sine_entry(6))) / 2), "halfway is the mean of the two")
+    assert_eq(sine(1073741824), Q31(FULL), "a quarter cycle is the peak")
+    assert_eq(sine(0), Q31(0))
+
+@test("a MIDI note number is an equal-tempered frequency")
+pitch_is_equal_tempered()
+    assert(pitch(69.0) == 440.0)
+    assert((pitch(81.0) - 880.0).abs() < 0.000001)
+    assert((pitch(60.0) - 261.6255653).abs() < 0.000001)
+
+private tone() -> Instrument = instrument([Partial(1.0, 1.0)], adsr(0.005, 0.01, 1.0, 0.05)).unwrap()
+
+@test("a score is refused when a note names an instrument it does not have")
+score_checks_instruments()
+    val ins = [tone()]
+    val notes = [note(0.0, 1.0, 440.0), note(1.0, 1.0, 440.0, instrument = 1)]
+    assert_eq(score(notes, ins).unwrap_err(), NoSuchInstrument(1))
+
+@test("a score is refused when its notes are out of order")
+score_checks_order()
+    val ins = [tone()]
+    val notes = [note(0.5, 1.0, 440.0), note(0.25, 1.0, 440.0)]
+    assert_eq(score(notes, ins).unwrap_err(), OutOfOrder(1))
+    assert(score([note(0.25, 1.0, 440.0), note(0.25, 1.0, 550.0)], ins).is_ok(), "a chord starts together")
+
+@test("an instrument is refused with no partials or too many")
+instrument_checks_partials()
+    val none: []const Partial = []
+    assert_eq(instrument(none, pluck(1.0, 0.1)).unwrap_err(), NoPartials)
+    val nine = [Partial(1.0, 0.1); 9]
+    assert_eq(instrument(nine, pluck(1.0, 0.1)).unwrap_err(), TooManyPartials(9))
+    assert(instrument(nine[..<8], pluck(1.0, 0.1)).is_ok())
+
+@test("a synth is refused a sample rate of zero")
+synth_needs_a_rate()
+    val ins = [tone()]
+    val sc = score([note(0.0, 1.0, 440.0)], ins).unwrap()
+    assert_eq(synth(sc, 0).unwrap_err(), NoSampleRate)
+
+@test("a note's times are microseconds and its frequency Q16.16")
+note_fields()
+    val n = note(1.5, 0.25, 440.5, 0.5, 2)
+    assert_eq(n.start, 1500000)
+    assert_eq(n.length, 250000)
+    assert_eq(n.hold, 250000, "released when the written length ends")
+    assert_eq(n.frequency, 28868608)
+    assert_eq(n.velocity, q31(0.5))
+    assert_eq(n.instrument, 2)
+    assert_eq(n.held(0.125).hold, 125000)
+    assert_eq(n.held(0.125).length, 250000, "articulation leaves the written length alone")
+
+@test("the WAV header says what the bytes after it are")
+wav_header_fields()
+    val ins = [tone()]
+    val sc = score([note(0.0, 0.1, 440.0)], ins).unwrap()
+    val bytes = render_wav(sc, 22050).unwrap()
+    val b = bytes.view()
+    val frames = u32((b.len - WAV_HEADER) / 2)
+
+    assert_eq(str_cast(b[0..<4]), "RIFF")
+    assert_eq(get_u32_le(b[4..<8]).unwrap(), u32(b.len - 8))
+    assert_eq(str_cast(b[8..<12]), "WAVE")
+    assert_eq(str_cast(b[12..<16]), "fmt ")
+    assert_eq(get_u32_le(b[16..<20]).unwrap(), 16)
+    assert_eq(get_u16_le(b[20..<22]).unwrap(), 1, "PCM")
+    assert_eq(get_u16_le(b[22..<24]).unwrap(), 1, "mono")
+    assert_eq(get_u32_le(b[24..<28]).unwrap(), 22050)
+    assert_eq(get_u32_le(b[28..<32]).unwrap(), 44100)
+    assert_eq(get_u16_le(b[32..<34]).unwrap(), 2)
+    assert_eq(get_u16_le(b[34..<36]).unwrap(), 16)
+    assert_eq(str_cast(b[36..<40]), "data")
+    assert_eq(get_u32_le(b[40..<44]).unwrap(), frames * 2)
+
+    // A tenth of a second, plus a 50 ms release, rounded up to the renderer's 1024-sample blocks.
+    assert(frames >= 3308 && frames < 3308 + 1024, "{frames} frames")
+
+@test("the WAV header is refused storage too short for it")
+wav_header_needs_room()
+    var small: [43]u8
+    assert(!wav_header(small[..], 44100, 10))
+    var room: [44]u8
+    assert(wav_header(room[..], 44100, 10))
+    assert(!wav_header(room[..], 44100, 2147483648), "more frames than 32-bit sizes can count")
+
+@test("the samples in a WAV file are the samples render gives")
+wav_samples_match_render()
+    val ins = [tone()]
+    val sc = score([note(0.0, 0.05, 440.0)], ins).unwrap()
+    val bytes = render_wav(sc, 8000).unwrap()
+    val b = bytes.view()
+
+    var s = synth(sc, 8000).unwrap()
+    var block: [1024]i16
+    s.render(block[..])
+    for i in 0usize..<1024
+        val got = i16(get_u16_le(b[WAV_HEADER + 2 * i..<WAV_HEADER + 2 * i + 2]).unwrap())
+        assert_eq(got, block[i], "sample {i}")

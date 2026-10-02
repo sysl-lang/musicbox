@@ -1,0 +1,281 @@
+module sh.sysl.musicbox
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{Float, Signed}
+
+// What a rendered note sounds like, measured from the samples: its pitch by counting zero crossings,
+// its envelope by the peak of each cycle, its clicks by the largest step from one sample to the next.
+
+private const RATE: u32 = 48000
+
+// The whole of a score, rendered in blocks until the synth says it is finished.
+private render_all(sc: Score, rate: u32) -> Buf[i16]
+    var s = synth(sc, rate).unwrap()
+    var out: Buf[i16] = buf()
+    var block: [256]i16
+    loop
+        val more = s.render(block[..])
+        out.extend(block[..])
+        if !more then break
+    out
+
+// How many times the signal crosses upward through zero in `from..<to`.
+private rising(xs: []const i16, from: usize, to: usize) -> usize
+    var n: usize = 0
+    for i in from + 1..<to
+        if xs[i - 1] < 0 && xs[i] >= 0 then n += 1
+    n
+
+// The largest magnitude in `from..<to`.
+private peak(xs: []const i16, from: usize, to: usize) -> int
+    var p = 0
+    for i in from..<to
+        val v = int(xs[i]).abs()
+        if v > p then p = v
+    p
+
+// The largest step from one sample to the next, anywhere.
+private steepest(xs: []const i16) -> int
+    var d = 0
+    for i in 1..<xs.len
+        val v = (int(xs[i]) - int(xs[i - 1])).abs()
+        if v > d then d = v
+    d
+
+// The index one past the last sample that is not silence.
+private sound_ends(xs: []const i16) -> usize
+    var end = xs.len
+    while end > 0 && xs[end - 1] == 0 do end -= 1
+    end
+
+private sine_with(env: Envelope) -> Instrument = instrument([Partial(1.0, 1.0)], env).unwrap()
+
+private ms(n: usize) -> usize = n * usize(RATE) / 1000
+
+@test("a rendered tone has the pitch it was written at")
+pitch_by_zero_crossings()
+    val ins = [sine_with(adsr(0.005, 0.01, 1.0, 0.05))]
+    val notes = [note(0.0, 1.0, 440.0)]
+    val out = render_all(score(notes, ins).unwrap(), RATE)
+    assert_eq(rising(out.view(), ms(250), ms(750)), 220, "half a second of A4")
+
+    val high = [note(0.0, 1.0, 1234.0)]
+    val out2 = render_all(score(high, ins).unwrap(), 44100)
+    val n = rising(out2.view(), 11025, 33075)
+    assert(n >= 616 && n <= 617, "half a second of 1234 Hz crossed {n} times")
+
+@test("a partial sounds at its ratio of the note's frequency")
+partial_ratio()
+    val ins = [instrument([Partial(3.0, 1.0)], adsr(0.005, 0.01, 1.0, 0.05)).unwrap()]
+    val out = render_all(score([note(0.0, 1.0, 200.0)], ins).unwrap(), RATE)
+    assert_eq(rising(out.view(), ms(250), ms(750)), 300)
+
+@test("a partial above half the sample rate is left out rather than aliased")
+nyquist_drops_partial()
+    val both = [instrument([Partial(1.0, 0.5), Partial(2.0, 0.5)], adsr(0.005, 0.01, 1.0, 0.05)).unwrap()]
+    val one = [instrument([Partial(1.0, 0.5)], adsr(0.005, 0.01, 1.0, 0.05)).unwrap()]
+    val notes = [note(0.0, 0.1, 7000.0)]
+    val a = render_all(score(notes, both).unwrap(), 11025)
+    val b = render_all(score(notes, one).unwrap(), 11025)
+    assert_slice_eq(a.view(), b.view(), "14 kHz cannot sound at 11025 samples a second")
+
+    val c = render_all(score(notes, both).unwrap(), 44100)
+    val d = render_all(score(notes, one).unwrap(), 44100)
+    assert(c.view() != d.view(), "and does at 44100")
+
+// A 1 kHz tone at 48 kHz is 48 samples a cycle, so a 1 ms window holds exactly one peak.
+@test("an ADSR note rises, falls to its sustain, holds, and releases to silence")
+adsr_shape()
+    val ins = [sine_with(adsr(0.01, 0.02, 0.5, 0.05))]
+    val out = render_all(score([note(0.0, 0.2, 1000.0)], ins).unwrap(), RATE)
+    val xs = out.view()
+
+    var last = 0
+    for w in 0..<10usize
+        val p = peak(xs, ms(w), ms(w + 1))
+        assert(p > last, "the attack rises in every millisecond: {p} after {last} at {w} ms")
+        last = p
+    val top = peak(xs, ms(9), ms(12))
+    assert(top >= 32000, "the attack reaches full level, {top}")
+
+    for w in 60..<199usize
+        val p = peak(xs, ms(w), ms(w + 1))
+        assert(p >= 16220 && p <= 16550, "the sustain holds at half, {p} at {w} ms")
+
+    // A release time is the fall from full level, so from half it takes ln(0.001 / 0.501) / ln(0.001
+    // / 1.001) of the 50 ms written, 45 ms.
+    last = 16550
+    for w in 201..<244usize
+        val p = peak(xs, ms(w), ms(w + 1))
+        assert(p < last, "the release falls in every millisecond: {p} after {last} at {w} ms")
+        last = p
+
+    val end = sound_ends(xs)
+    assert(end > ms(243) && end <= ms(246), "silent once the release has run, at sample {end}")
+
+@test("the decay is exponential, so it falls faster at its start than at its end")
+decay_is_exponential()
+    val ins = [sine_with(adsr(0.001, 0.1, 0.0, 0.05))]
+    val out = render_all(score([note(0.0, 1.0, 1000.0)], ins).unwrap(), RATE)
+    val xs = out.view()
+    val early = peak(xs, ms(2), ms(3)) - peak(xs, ms(12), ms(13))
+    val late = peak(xs, ms(80), ms(81)) - peak(xs, ms(90), ms(91))
+    assert(early > 3 * late, "the first 10 ms fell {early} and 10 ms near the end {late}")
+
+@test("a pluck starts at full level and decays even while it is held")
+pluck_decays()
+    val ins = [sine_with(pluck(0.2, 0.05))]
+    val out = render_all(score([note(0.0, 2.0, 1000.0)], ins).unwrap(), RATE)
+    val xs = out.view()
+    assert(peak(xs, 0, ms(1)) >= 32000, "full level in the first cycle")
+
+    val p = peak(xs, ms(100), ms(101))
+    assert(p > 970 && p < 1100, "halfway through a 200 ms fall to -60 dB is -30 dB, {p}")
+
+    val end = sound_ends(xs)
+    assert(end < ms(400), "finished long before the two-second hold, at sample {end}")
+
+@test("articulation: a note released early stops before its written end")
+release_point_is_not_length()
+    val ins = [sine_with(adsr(0.005, 0.01, 1.0, 0.03))]
+    val legato = render_all(score([note(0.0, 0.4, 1000.0)], ins).unwrap(), RATE)
+    val staccato = render_all(score([note(0.0, 0.4, 1000.0).held(0.2)], ins).unwrap(), RATE)
+    val a = sound_ends(legato.view())
+    val b = sound_ends(staccato.view())
+    assert(a > ms(420) && a <= ms(430), "the full note ends with its release, at {a}")
+    assert(b > ms(220) && b <= ms(230), "the staccato one 200 ms sooner, at {b}")
+
+// The fastest a 1 kHz full-scale sine moves is 2 pi 1000 / 48000 of full scale a sample, 4289. A
+// note switched on or off without its envelope would jump by up to the whole range.
+@test("notes start and stop without a click")
+no_clicks()
+    val ins = [sine_with(adsr(0.002, 0.01, 0.8, 0.0)), sine_with(pluck(0.3, 0.0))]
+    val notes = [
+        note(0.0, 0.1, 1000.0),
+        note(0.1003, 0.05, 1000.0, instrument = 1),
+        note(0.3, 0.0007, 1000.0),
+        note(0.4, 0.1, 1000.0).held(0.0001)]
+    val out = render_all(score(notes, ins).unwrap(), RATE)
+    val d = steepest(out.view())
+    assert(d <= 4300, "the steepest step is {d}")
+
+@test("a release written as zero still takes the 20 ms minimum")
+minimum_release()
+    val ins = [sine_with(adsr(0.002, 0.01, 1.0, 0.0))]
+    val out = render_all(score([note(0.0, 0.1, 1000.0)], ins).unwrap(), RATE)
+    val end = sound_ends(out.view())
+    assert(end > ms(115) && end <= ms(120), "the note ends 20 ms after its release begins, at {end}")
+
+@test("notes that overlap sound together")
+polyphony()
+    val ins = [sine_with(adsr(0.005, 0.01, 1.0, 0.05))]
+    val notes = [note(0.0, 0.5, 440.0, 0.3), note(0.0, 0.5, 550.0, 0.3), note(0.1, 0.5, 660.0, 0.3)]
+    var s = synth(score(notes, ins).unwrap(), RATE).unwrap()
+    var block: [960]i16
+    s.render(block[..])
+    assert_eq(s.sounding(), 2, "the chord at 20 ms")
+    for _ in 0..<5 do s.render(block[..])
+    assert_eq(s.sounding(), 3, "and the third note from 100 ms")
+
+// The mix is an exact integer sum, so once the steal has happened the output has to equal a score
+// that never had the stolen note at all -- and only if the quietest one was taken.
+@test("a note starting with every voice busy takes the quietest voice")
+voice_stealing()
+    val ins = [sine_with(adsr(0.001, 0.001, 1.0, 0.05))]
+    var full: Buf[Note] = buf()
+    var without: Buf[Note] = buf()
+    for k in 0..<VOICES
+        val quiet = k == 17
+        val n = note(0.0, 1.0, 200.0 + 37.0 * real(k), if quiet then 0.005 else 0.02 + 0.0001 * real(k))
+        full.push(n)
+        if !quiet then without.push(n)
+    full.push(note(0.05, 0.5, 3000.0, 0.02))
+    without.push(note(0.05, 0.5, 3000.0, 0.02))
+
+    var s = synth(score(full.view(), ins).unwrap(), RATE).unwrap()
+    var block: [2400]i16
+    s.render(block[..])
+    assert_eq(s.sounding(), VOICES, "every voice busy at 50 ms")
+
+    val a = render_all(score(full.view(), ins).unwrap(), RATE)
+    val b = render_all(score(without.view(), ins).unwrap(), RATE)
+    val from = ms(50)
+    assert_slice_eq(a.view()[from..], b.view()[from..], "the quietest note is the one that stopped")
+    assert(a.view()[..<from] != b.view()[..<from], "and it was sounding before")
+
+@test("a mix too loud for 16 bits clips at full scale instead of wrapping")
+saturates()
+    val ins = [sine_with(adsr(0.001, 0.001, 1.0, 0.05))]
+    val one = render_all(score([note(0.0, 0.1, 500.0, 0.8)], ins).unwrap(), RATE)
+    val two = render_all(score([note(0.0, 0.1, 500.0, 0.8), note(0.0, 0.1, 500.0, 0.8)], ins).unwrap(), RATE)
+    val a = one.view()
+    val b = two.view()
+    assert_eq(a.len, b.len)
+
+    var clipped = 0
+    for i in 0..<a.len
+        val want = int(a[i]) * 2
+        val clamped = if want > 32767 then 32767 else if want < -32768 then -32768 else want
+        assert((int(b[i]) - clamped).abs() <= 2, "sample {i}: {b[i]} for twice {a[i]}")
+        if clamped != want then clipped += 1
+    assert(clipped > 1000, "the test reached the clipping, {clipped} samples")
+
+@test("the same score renders the same samples, and a rewind plays it again")
+deterministic()
+    val ins = [sine_with(adsr(0.005, 0.02, 0.6, 0.05)), sine_with(pluck(0.3, 0.05))]
+    val notes = [note(0.0, 0.2, 440.0), note(0.05, 0.2, 660.0, 0.5, 1), note(0.1, 0.1, 330.0, 0.7)]
+    val sc = score(notes, ins).unwrap()
+    val first = render_all(sc, RATE)
+    assert_slice_eq(render_all(sc, RATE).view(), first.view(), "a second synth")
+
+    var s = synth(sc, RATE).unwrap()
+    var again: Buf[i16] = buf()
+    var block: [256]i16
+    while s.render(block[..]) do ()
+    s.rewind()
+    loop
+        val more = s.render(block[..])
+        again.extend(block[..])
+        if !more then break
+    assert_slice_eq(again.view(), first.view(), "the same synth after a rewind")
+
+    assert_slice_eq(render_wav(sc, RATE).unwrap().view(), render_wav(sc, RATE).unwrap().view())
+
+@test("render answers false once the score has finished, and fills with silence after it")
+render_reports_the_end()
+    val ins = [sine_with(adsr(0.005, 0.01, 1.0, 0.02))]
+    var s = synth(score([note(0.01, 0.01, 440.0)], ins).unwrap(), RATE).unwrap()
+    var block: [480]i16
+    assert(s.render(block[..]), "the note has not started")
+    assert_eq(peak(block[..], 0, 480), 0)
+    assert(s.render(block[..]), "it is sounding")
+    assert(peak(block[..], 0, 480) > 0)
+    assert(s.render(block[..]))
+    assert(!s.render(block[..]), "its release is over by 40 ms")
+    assert(!s.render(block[..]))
+    assert_eq(peak(block[..], 0, 480), 0)
+
+@test("seeking skips the notes that started before the seek point")
+seek_skips_earlier_notes()
+    val ins = [sine_with(adsr(0.005, 0.01, 1.0, 0.02))]
+    val sc = score([note(0.0, 0.05, 440.0), note(0.1, 0.05, 880.0)], ins).unwrap()
+    val whole = render_all(sc, RATE)
+
+    var s = synth(sc, RATE).unwrap()
+    s.seek(u64(ms(80)))
+    assert_eq(s.position(), u64(ms(80)))
+    var rest: [9600]i16
+    s.render(rest[..])
+    assert_eq(peak(rest[..], 0, ms(20)), 0, "the first note is not resumed")
+    assert_slice_eq(rest[ms(20)..<ms(85)], whole.view()[ms(100)..<ms(165)], "the second plays as written")
+
+@test("velocity scales a note's level")
+velocity_scales()
+    val ins = [sine_with(adsr(0.001, 0.001, 1.0, 0.05))]
+    val loud = render_all(score([note(0.0, 0.1, 1000.0)], ins).unwrap(), RATE)
+    val soft = render_all(score([note(0.0, 0.1, 1000.0, 0.25)], ins).unwrap(), RATE)
+    val a = peak(loud.view(), ms(20), ms(80))
+    val b = peak(soft.view(), ms(20), ms(80))
+    assert(a >= 32760, "full velocity is full scale, {a}")
+    assert(b >= 8188 && b <= 8193, "a quarter velocity is a quarter of it, {b}")
