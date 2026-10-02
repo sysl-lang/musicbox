@@ -4,14 +4,14 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.0" }
+//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `musicbox`; the module a program imports is `sh.sysl.musicbox`.
 
 package {
   name    = "musicbox"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // The oldest compiler this package has been built and tested with.
   sysl    = "0.0.155"

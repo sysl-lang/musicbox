@@ -41,7 +41,7 @@ q31_saturates()
 sine_table_recomputes()
     for i in 0usize..<1024
         val want = i32(((2.0 * pi * real(i) / 1024.0).sin() * 2147483647.0).round())
-        assert_eq(sine_entry(i), want, "entry {i}")
+        assert_eq(sine_entry(i), want, s"entry ${i}")
 
 // The interpolation is what keeps a low note clean: reading the nearest entry instead is off by up to
 // half a step, 0.3% of full scale, and the bound here is a hundredth of that.
@@ -53,7 +53,7 @@ sine_interpolates()
         val exact = 2.0 * pi * real(phase) / 4294967296.0
         val err = (sine(phase).as_real() - exact.sin()).abs()
         if err > worst then worst = err
-    assert(worst < 0.00001, "worst error {worst}")
+    assert(worst < 0.00001, s"worst error ${worst}")
 
     val half = sine(5 * 4194304 + 2097152).raw
     assert_eq(half, i32((i64(sine_entry(5)) + i64(sine_entry(6))) / 2), "halfway is the mean of the two")
@@ -130,7 +130,7 @@ wav_header_fields()
     assert_eq(get_u32_le(b[40..<44]).unwrap(), frames * 2)
 
     // A tenth of a second, plus a 50 ms release, rounded up to the renderer's 1024-sample blocks.
-    assert(frames >= 3308 && frames < 3308 + 1024, "{frames} frames")
+    assert(frames >= 3308 && frames < 3308 + 1024, s"${frames} frames")
 
 @test("the WAV header is refused storage too short for it")
 wav_header_needs_room()
@@ -152,4 +152,4 @@ wav_samples_match_render()
     s.render(block[..])
     for i in 0usize..<1024
         val got = i16(get_u16_le(b[WAV_HEADER + 2 * i..<WAV_HEADER + 2 * i + 2]).unwrap())
-        assert_eq(got, block[i], "sample {i}")
+        assert_eq(got, block[i], s"sample ${i}")

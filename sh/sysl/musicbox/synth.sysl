@@ -1,6 +1,6 @@
 module sh.sysl.musicbox
 
-import sysl.math.{Float, max}
+import sysl.math.{Float, max, min}
 
 // The renderer: a score, a fixed pool of voices, and a clock counted in samples.
 //
@@ -148,6 +148,69 @@ private struct Voice
 
         i64((sum * self.level).raw)
 
+    // The envelope one sample on, as `sample` moves it, without the oscillators. It is a copy of
+    // `sample`'s first half rather than a call from it, because a second caller is enough for the
+    // optimizer to stop folding a shared body into `render`, and that costs every sample a call. The
+    // tests holding `seek` sample-identical to continuous play are what keep the two copies the same.
+    private tick(*self, shape: Shape)
+        if self.age == self.hold && self.stage != Idle then self.stage = Release
+        self.age += 1
+
+        shape match
+            Ramp(step, decay, sustain, release) -> self.stage match
+                Attack ->
+                    val next = i64(self.level.raw) + i64(step)
+                    if next >= i64(PEAK)
+                        self.level = Q31(PEAK)
+                        self.stage = Decay
+                    else
+                        self.level = Q31(i32(next))
+                Decay ->
+                    self.level = decay.apply(self.level)
+                    if self.level <= sustain
+                        self.level = sustain
+                        self.stage = Sustain
+                Release -> self.level = release.apply(self.level)
+                _ -> ()
+            Fall(decay, release) -> self.stage match
+                Release -> self.level = release.apply(self.level)
+                Idle -> ()
+                _ -> self.level = self.level * decay
+
+        if self.level.raw < SILENT && self.stage != Attack
+            self.stage = Idle
+            self.level = Q31(0)
+
+    // The envelope `n` samples on, exactly where `n` calls of `sample` would leave it, without the
+    // oscillators. A curve is the recurrence `level * coeff + base`, which no closed form reproduces to
+    // the bit, so a decay or a release is stepped one sample at a time; but an attack short of its peak
+    // adds the same step every sample and a sustain changes nothing, so either is crossed at once, up
+    // to the release point. A held note therefore costs its attack, decay and release, never its hold.
+    private advance(*self, shape: Shape, n: u64)
+        var left = n
+        while left > 0 && self.stage != Idle
+            var run: u64 = 0
+            shape match
+                Ramp(step, _, _, _) -> self.stage match
+                    Attack ->
+                        run = min(left, min(u64(self.hold - self.age), u64((PEAK - 1 - self.level.raw) / step)))
+                        self.level = Q31(self.level.raw + i32(run) * step)
+                    Sustain -> run = min(left, u64(self.hold - self.age))
+                    _ -> ()
+                _ -> ()
+
+            if run == 0
+                self.tick(shape)
+                left -= 1
+            else
+                self.age += u32(run)
+                left -= run
+
+    // Every partial at the phase continuous play would have turned it to by now: one increment for
+    // each sample since the note began, wrapping as the accumulator does.
+    private catch_up(*self)
+        for k in 0..<self.count do self.phases[k] = self.incs[k] * self.age
+
 private idle() -> Voice =
     Voice(Idle, Q31(0), Q31(0), 0, 0, 0, [0; MAX_PARTIALS], [0; MAX_PARTIALS], [Q31(0); MAX_PARTIALS], 0)
 
@@ -199,16 +262,41 @@ struct Synth
     // Go back to the beginning, as though nothing had been rendered.
     rewind(*self) = self.seek(0)
 
-    // Continue from `sample` samples into the score. Every voice falls silent, and the notes that
-    // start at or after that point play as written; a note that began before it is not resumed.
+    // Continue from `sample` samples into the score, exactly as though it had been playing from the
+    // beginning. A note sounding at that point carries on from it: its envelope at the level and stage
+    // it would have reached, released if its release point has passed, and every partial at the phase
+    // it would have turned to. A note that has already died away stays silent.
+    //
+    // **The samples that follow are the ones continuous play produces, to the bit, even when the pool
+    // overflows.** The notes before the point are started in order of their start, each on the voice
+    // `render` would have given it, with every envelope carried forward to that start first. So a
+    // note that finds every voice busy takes the voice that is quietest *then*, as it would in play.
+    //
+    // The cost is paid here, once, and never in `render`: each note before the point costs a pass
+    // over the voices and the samples of its curves -- its decay and release, or the whole of a pluck
+    // -- since a curve is stepped sample by sample to stay exact. Its attack and sustain are crossed
+    // at once, so a long held note costs no more than a short one.
     seek(*self, sample: u64)
         for k in 0..<VOICES do self.voices[k] = idle()
-        self.clock = sample
         self.next = 0
         self.next_at = self.start_of(0)
+
+        var at: u64 = 0
         while self.next_at < sample
-            self.next += 1
-            self.next_at = self.start_of(self.next)
+            self.carry(self.next_at - at)
+            at = self.next_at
+            self.begin()
+        self.carry(sample - at)
+
+        for k in 0..<VOICES
+            if self.voices[k].stage != Idle then self.voices[k].catch_up()
+        self.clock = sample
+
+    // Every sounding voice's envelope `n` samples on.
+    private carry(*self, n: u64)
+        for k in 0..<VOICES
+            if self.voices[k].stage != Idle
+                self.voices[k].advance(self.patches[self.voices[k].patch].shape, n)
 
     private samples(self, micros: u64) -> u64 = (micros * u64(self.rate) + 500000) / 1000000
 
