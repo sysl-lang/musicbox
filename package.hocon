@@ -1,0 +1,30 @@
+// A music synthesizer in pure sysl: a score of notes, a fixed pool of voices, and 16-bit samples
+// pulled out at whatever rate the audio device runs at.
+//
+// This is the block a *consumer* writes to reach this package:
+//
+//     dependencies {
+//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `musicbox`; the module a program imports is `sh.sysl.musicbox`.
+
+package {
+  name    = "musicbox"
+  version = "0.1.0"
+
+  // The oldest compiler this package has been built and tested with.
+  sysl    = "0.0.155"
+}
+
+// **`requires {}` is exact.** The renderer asks for no operating system, no clock, no files and no
+// threads: it is handed a buffer and fills it. It carries no C, so there is no header to be missing
+// on a freestanding target, and it keeps no module storage that an initializer would have to fill --
+// the sine table is a literal laid straight into the object file. A board with no floating point
+// still builds it; the floats are in setting a score and a synth up, and the per-sample loop is
+// integer arithmetic.
+//
+// The one heap user is `render_wav`, which grows a buffer for a whole file. A program that never
+// calls it never reaches the allocator.
+requires {
+}
