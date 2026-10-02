@@ -2,6 +2,7 @@ module sh.sysl.musicbox
 
 import sysl.buf.{Buf, buf}
 import sysl.encoding.{put_u16_le, put_u32_le}
+import sysl.fs.{IoError, write_bytes}
 
 // A WAV file: a 44-byte RIFF header and 16-bit little-endian PCM, mono.
 //
@@ -59,3 +60,17 @@ render_wav(score: Score, rate: u32) -> Result[Buf[u8], MusicError]
 
     if !wav_header(bytes.view(), rate, frames) then return Err(TooLong)
     Ok(bytes)
+
+// Why `save_wav` did not leave a file behind: the score would not render, or the file would not write.
+enum SaveError
+    Render(error: MusicError)
+    Write(error: IoError)
+
+@needs(os)
+save_wav(score: Score, rate: u32, file: string) -> Result[unit, SaveError]
+    val bytes = render_wav(score, rate) match
+        Ok(b) -> b
+        Err(e) -> return Err(Render(e))
+    write_bytes(file, bytes.view()) match
+        Ok(_) -> Ok(())
+        Err(e) -> Err(Write(e))
