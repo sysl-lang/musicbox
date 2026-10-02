@@ -1,0 +1,274 @@
+module sh.sysl.musicbox
+
+import sysl.math.{Float, max}
+
+// The renderer: a score, a fixed pool of voices, and a clock counted in samples.
+//
+// **The output is a pull.** A caller hands `render` a buffer and gets it back full of 16-bit mono
+// samples at the rate the synth was built for, so the same synth feeds an audio callback, a DMA
+// buffer on a board, or a WAV file, and knows nothing about any of them. The rate is the device's
+// choice rather than a constant here, since 44100, 48000 and 22050 are all common and a board's I2S
+// clock may divide to something else entirely.
+//
+// **Everything per sample is integer arithmetic.** Building a synth converts every instrument to fixed
+// point at its rate, once; starting a note converts its times and frequency with integer division;
+// and the loop over samples does table lookups, Q31 multiplies and adds. Nothing in the loop
+// allocates, and the synth's whole memory is its voice pool.
+
+// How many notes may sound at once. When a note starts with every voice busy, the quietest voice is
+// taken for it, which is the voice whose loss is least audible.
+const VOICES: usize = 32
+
+// The most instruments a score may hold, each converted to fixed point once when a synth is built.
+const MAX_INSTRUMENTS: usize = 16
+
+// The shortest release, 20 ms. A note let go faster than this would drop to silence in a few
+// samples, which is a click whatever the instrument meant.
+private const MIN_RELEASE: real = 0.02
+
+// Below this level, about -102 dB, a decaying voice is a quarter of the smallest step a 16-bit
+// sample can take, so it is finished and its voice is free.
+private const SILENT: i32 = 16384
+
+private const PEAK: i32 = 2147483647
+
+// One exponential segment in the RC style: each sample, `level * coeff + base`. The base aims the
+// curve past where it is going, so it arrives in the time it was given instead of approaching for
+// ever.
+private struct Segment
+    coeff: Q31
+    base: Q31
+
+    apply(self, level: Q31) -> Q31 = level * self.coeff + self.base
+
+// The coefficient that takes a curve aimed `ratio` past its end across the whole distance in
+// `samples` steps.
+private segment(samples: real, ratio: real, target: real) -> Segment
+    val coeff = (-((1.0 + ratio) / ratio).ln() / samples).exp()
+    Segment(q31(coeff), q31((target - ratio) * (1.0 - coeff)))
+
+// An envelope at one sample rate, in fixed point.
+private enum Shape
+    Ramp(step: i32, decay: Segment, sustain: Q31, release: Segment)
+    Fall(decay: Q31, release: Segment)
+
+// Where a voice's envelope is.
+private enum Stage
+    Attack
+    Decay
+    Sustain
+    Release
+    Idle
+
+// An instrument at one sample rate: partial ratios in Q16.16, amplitudes in Q31 scaled so that they
+// sum to at most 1, and the envelope converted.
+private struct Patch
+    ratios: [MAX_PARTIALS]u32
+    amps: [MAX_PARTIALS]Q31
+    count: usize
+    shape: Shape
+
+private patch(ins: Instrument, rate: real) -> Patch
+    val count = ins.partial_count()
+
+    var total = 0.0
+    for i in 0..<count do total += ins.partial(i).amplitude.abs()
+    val scale = if total > 1.0 then 1.0 / total else 1.0
+
+    var ratios: [MAX_PARTIALS]u32
+    var amps: [MAX_PARTIALS]Q31
+    for i in 0..<count
+        ratios[i] = u32(ins.partial(i).ratio * 65536.0 + 0.5)
+        amps[i] = q31(ins.partial(i).amplitude * scale)
+
+    val shape = ins.envelope match
+        Adsr(a, d, s, r, curve) ->
+            val attack = max(a * rate, 1.0)
+            val decay = max(d * rate, 1.0)
+            val release = max(r, MIN_RELEASE) * rate
+            Ramp(i32(2147483647.0 / attack) + 1, segment(decay, curve, s), q31(s), segment(release, curve, 0.0))
+        Pluck(d, r) ->
+            val decay = max(d * rate, 1.0)
+            val release = max(r, MIN_RELEASE) * rate
+            Fall(q31((0.001.ln() / decay).exp()), segment(release, DEFAULT_CURVE, 0.0))
+
+    Patch(ratios, amps, count, shape)
+
+// One sounding note: its envelope, and an oscillator per partial.
+private struct Voice
+    stage: Stage
+    level: Q31
+    velocity: Q31
+    patch: usize
+    age: u32                        // samples since the note began
+    hold: u32                       // samples from the beginning to the release
+    phases: [MAX_PARTIALS]u32       // DDS accumulators: the whole u32 range is one cycle
+    incs: [MAX_PARTIALS]u32
+    amps: [MAX_PARTIALS]Q31
+    count: usize
+
+    // How loud the voice is now, for choosing which one to take when every voice is busy.
+    loudness(self) -> Q31 = self.level * self.velocity
+
+    // The voice's next sample, in Q31, and its envelope one sample on.
+    sample(*self, shape: Shape) -> i64
+        if self.age == self.hold && self.stage != Idle then self.stage = Release
+        self.age += 1
+
+        shape match
+            Ramp(step, decay, sustain, release) -> self.stage match
+                Attack ->
+                    val next = i64(self.level.raw) + i64(step)
+                    if next >= i64(PEAK)
+                        self.level = Q31(PEAK)
+                        self.stage = Decay
+                    else
+                        self.level = Q31(i32(next))
+                Decay ->
+                    self.level = decay.apply(self.level)
+                    if self.level <= sustain
+                        self.level = sustain
+                        self.stage = Sustain
+                Release -> self.level = release.apply(self.level)
+                _ -> ()
+            Fall(decay, release) -> self.stage match
+                Release -> self.level = release.apply(self.level)
+                Idle -> ()
+                _ -> self.level = self.level * decay
+
+        if self.level.raw < SILENT && self.stage != Attack
+            self.stage = Idle
+            self.level = Q31(0)
+            return 0
+
+        var sum = Q31(0)
+        for k in 0..<self.count
+            sum = sum + sine(self.phases[k]) * self.amps[k]
+            self.phases[k] += self.incs[k]
+
+        i64((sum * self.level).raw)
+
+private idle() -> Voice =
+    Voice(Idle, Q31(0), Q31(0), 0, 0, 0, [0; MAX_PARTIALS], [0; MAX_PARTIALS], [Q31(0); MAX_PARTIALS], 0)
+
+// What an instrument slot the score does not use holds.
+private unused() -> Patch = Patch([0; MAX_PARTIALS], [Q31(0); MAX_PARTIALS], 0, Fall(Q31(0), Segment(Q31(0), Q31(0))))
+
+struct Synth
+    private score: Score
+    private rate: u32
+    private patches: [MAX_INSTRUMENTS]Patch
+    private voices: [VOICES]Voice
+    private clock: u64              // samples rendered since the beginning of the score
+    private next: usize             // the first note not yet started
+    private next_at: u64            // the sample it starts at
+
+    // The sample rate this synth renders at.
+    sample_rate(self) -> u32 = self.rate
+
+    // How many samples have been rendered since the beginning of the score.
+    position(self) -> u64 = self.clock
+
+    // How many voices are sounding.
+    sounding(self) -> usize
+        var n: usize = 0
+        for k in 0..<VOICES
+            if self.voices[k].stage != Idle then n += 1
+        n
+
+    // Fill `out` with the next samples of the score, and answer whether there is more to come. The
+    // buffer is always filled: once the last note has died away, the rest of it is silence and the
+    // answer is false.
+    render(*self, out: []i16) -> bool
+        for i in 0..<out.len
+            while self.next_at <= self.clock do self.begin()
+
+            var mix: i64 = 0
+            for k in 0..<VOICES
+                if self.voices[k].stage != Idle
+                    mix += self.voices[k].sample(self.patches[self.voices[k].patch].shape)
+
+            out[i] = clip(mix >> 16)
+            self.clock += 1
+
+        self.playing()
+
+    // Whether any note is still to start or still sounding.
+    playing(self) -> bool = self.next < self.score.note_list().len || self.sounding() > 0
+
+    // Go back to the beginning, as though nothing had been rendered.
+    rewind(*self) = self.seek(0)
+
+    // Continue from `sample` samples into the score. Every voice falls silent, and the notes that
+    // start at or after that point play as written; a note that began before it is not resumed.
+    seek(*self, sample: u64)
+        for k in 0..<VOICES do self.voices[k] = idle()
+        self.clock = sample
+        self.next = 0
+        self.next_at = self.start_of(0)
+        while self.next_at < sample
+            self.next += 1
+            self.next_at = self.start_of(self.next)
+
+    private samples(self, micros: u64) -> u64 = (micros * u64(self.rate) + 500000) / 1000000
+
+    private start_of(self, i: usize) -> u64
+        val notes = self.score.note_list()
+        if i < notes.len then self.samples(notes[i].start) else 18446744073709551615
+
+    // Start the next note in the score on a free voice, or on the quietest one if none is free.
+    private begin(*self)
+        val n = self.score.note_list()[self.next]
+        self.next += 1
+        self.next_at = self.start_of(self.next)
+
+        var k: usize = 0
+        var quietest = Q31(PEAK)
+        for j in 0..<VOICES
+            if self.voices[j].stage == Idle
+                k = j
+                break
+            val loud = self.voices[j].loudness()
+            if loud < quietest
+                quietest = loud
+                k = j
+
+        val p = self.patches[usize(n.instrument)]
+        var v = idle()
+        v.patch = usize(n.instrument)
+        v.velocity = n.velocity
+        v.hold = u32(self.samples(u64(n.hold)))
+        v.count = p.count
+        p.shape match
+            Ramp(_, _, _, _) ->
+                v.stage = Attack
+                v.level = Q31(0)
+            Fall(_, _) ->
+                v.stage = Decay
+                v.level = Q31(PEAK)
+
+        for j in 0..<p.count
+            val inc = (u64(n.frequency) * u64(p.ratios[j])) / u64(self.rate)
+            // A partial at or above half the sample rate would alias down to some unrelated pitch,
+            // so it is left out rather than played wrong.
+            if inc < 2147483648
+                v.incs[j] = u32(inc)
+                v.amps[j] = p.amps[j] * n.velocity
+
+        self.voices[k] = v
+
+// A synth that plays `score` at `rate` samples a second, from the beginning.
+synth(score: Score, rate: u32) -> Result[Synth, MusicError]
+    if rate == 0 then return Err(NoSampleRate)
+
+    var patches = [unused(); MAX_INSTRUMENTS]
+    val ins = score.instrument_list()
+    for i in 0..<ins.len do patches[i] = patch(ins[i], real(rate))
+
+    var s = Synth(score, rate, patches, [idle(); VOICES], 0, 0, 0)
+    s.rewind()
+    Ok(s)
+
+// A mix in Q31 sixteenths, saturated to a 16-bit sample. Two loud notes together clip at full scale
+// rather than wrapping around to the opposite sign, which is a click as loud as the speaker allows.
+private clip(x: i64) -> i16 = if x > 32767 then 32767 else if x < -32768 then -32768 else i16(x)

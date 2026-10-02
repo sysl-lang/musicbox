@@ -1,0 +1,61 @@
+module sh.sysl.musicbox
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{put_u16_le, put_u32_le}
+
+// A WAV file: a 44-byte RIFF header and 16-bit little-endian PCM, mono.
+//
+// The header is written into storage the caller supplies, so a board streaming audio to an SD card
+// can write one with no allocator; `render_wav` is the convenience that renders a whole score into a
+// growing buffer, for a test or for a program that wants a file.
+
+// The size of the header in front of the samples.
+const WAV_HEADER: usize = 44
+
+// The most samples a WAV file can describe: its sizes are 32-bit, and they count bytes.
+private const MAX_FRAMES: u64 = (4294967295 - 36) / 2
+
+// Write the header for `frames` mono 16-bit samples at `rate` into the first 44 bytes of `out`.
+// Answers false, writing nothing, when `out` is shorter than the header or `frames` more than a WAV
+// file can hold.
+wav_header(out: []u8, rate: u32, frames: u64) -> bool
+    if out.len < WAV_HEADER || frames > MAX_FRAMES then return false
+
+    val data = u32(frames * 2)
+    tag(out[0..<4], "RIFF")
+    put_u32_le(out[4..<8], 36 + data)
+    tag(out[8..<12], "WAVE")
+    tag(out[12..<16], "fmt ")
+    put_u32_le(out[16..<20], 16)            // the size of the format chunk
+    put_u16_le(out[20..<22], 1)             // PCM
+    put_u16_le(out[22..<24], 1)             // one channel
+    put_u32_le(out[24..<28], rate)
+    put_u32_le(out[28..<32], rate * 2)      // bytes a second
+    put_u16_le(out[32..<34], 2)             // bytes a frame
+    put_u16_le(out[34..<36], 16)            // bits a sample
+    tag(out[36..<40], "data")
+    put_u32_le(out[40..<44], data)
+    true
+
+private tag(out: []u8, name: string)
+    for i in 0..<4 do out[i] = name.bytes[i]
+
+// Render `score` from the beginning to its end at `rate`, as the bytes of a WAV file.
+render_wav(score: Score, rate: u32) -> Result[Buf[u8], MusicError]
+    var s = synth(score, rate)?
+    var bytes: Buf[u8] = buf()
+    var header: [WAV_HEADER]u8
+    bytes.extend(header[..])
+
+    var chunk: [1024]i16
+    var frames: u64 = 0
+    var more = true
+    while more
+        more = s.render(chunk[..])
+        for x in chunk
+            bytes.push(u8(x))
+            bytes.push(u8(x >> 8))
+        frames += 1024
+
+    if !wav_header(bytes.view(), rate, frames) then return Err(TooLong)
+    Ok(bytes)
