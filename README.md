@@ -6,13 +6,12 @@ same code renders a WAV file on a laptop and feeds an I2S buffer on a Pico.
 
 ```hocon
 dependencies {
-  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.1" }
+  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.2" }
 }
 ```
 
 ```sysl
 import sh.sysl.musicbox.*
-import sysl.fs.write_bytes
 
 val organ = instrument([Partial(1.0, 1.0), Partial(2.0, 0.5), Partial(3.0, 0.25)],
                        adsr(0.01, 0.1, 0.7, 0.3)).unwrap()
@@ -24,8 +23,27 @@ val notes = [
     note(0.5, 0.5, pitch(72.0), 0.6, instrument = 1).held(0.2)]
 
 val song = score(notes, [organ, harp]).unwrap()
-write_bytes("chord.wav", render_wav(song, 44100).unwrap().view()).unwrap()
+save_wav(song, 44100, "chord.wav").unwrap()
 ```
+
+## Saving a file
+
+```sysl
+@needs(os)
+save_wav(score: Score, rate: u32, file: string) -> Result[unit, SaveError]
+
+enum SaveError
+    Render(error: MusicError)     // the score would not render: a rate of zero, or too long for a WAV
+    Write(error: IoError)         // the file would not write: a missing directory, no permission, a full disk
+```
+
+`save_wav` renders the whole score with `render_wav` and writes the bytes to `file`. A score that will
+not render leaves no file behind. It is the one function in the package that reaches an operating
+system, and it says so with **`@needs(os)`**: the cost is charged at the *call*, so a board program
+importing `sh.sysl.musicbox` and calling only `render` still builds where there is no filesystem, and
+one that calls `save_wav` is refused at that call (see [Running on a board](#running-on-a-board)).
+Without an operating system, `render_wav` gives the bytes and `wav_header` writes the 44-byte header
+into storage the caller supplies.
 
 ## The shape of it
 
@@ -94,10 +112,9 @@ written in the text, so the text is the whole of the input:
 
 ```sysl
 import sh.sysl.musicbox.*
-import sysl.fs.write_bytes
 
 val song = parse("[key g major] << d'4 e' f' g'2 | <g, b, d>1 >>").unwrap()
-write_bytes("song.wav", render_wav(song, 44100).unwrap().view()).unwrap()
+save_wav(song, 44100, "song.wav").unwrap()
 ```
 
 Every block marked `musicbox` in this README is parsed by the test suite.
@@ -225,12 +242,40 @@ sysl build-c <probe dir> --target thumbv6m-freestanding --lib <this repo>
 ```
 
 Both build, and the disassembly of `Synth.render` has no floating-point instruction or call in it.
-The heap users are `render_wav`, which grows a buffer for a whole file (`wav_header` writes the 44-byte
+The heap users are `render_wav` and `save_wav`, which grow a buffer for a whole file (`wav_header` writes the 44-byte
 header into storage the caller supplies), and `parse`, which grows the score's notes and reads its
 numbers through `sh.sysl.parsing`. A probe calling `parse` builds for both targets too; linking it
 needs what a libc supplies -- `malloc` and `free`, `strtod` for a directive's number, `pow` for a
 frequency -- so it runs on a board with newlib (the Pico SDK, Zephyr, FreeRTOS), and a bare one plays
 scores built with `note` and `score` instead.
+
+### `save_wav` and `@needs(os)`
+
+`save_wav` is the package's one reach into an operating system, and naming it costs nothing until a
+program calls it. Three probes, each a program directory with a `package.hocon` and one `main.sysl`
+with no `module` line and an `@export("main")` that calls the API (sysl 0.0.159):
+
+```
+sysl build-c <render-only probe> --target thumbv6m-freestanding --lib <this repo>
+```
+
+with `capabilities { os = false, posix = false }` in the probe's manifest **builds**: the probe
+imports `sh.sysl.musicbox.*`, the module that declares `save_wav` and `SaveError`, and calls
+`render`; the archive's undefined symbols are compiler builtins, `malloc`/`free`, `exp`/`log`,
+`putchar` and `exit`, with no file call among them. The same probe under `@no_os` on the host builds
+too. A no-os probe that **calls** `save_wav` is refused, at the call:
+
+```
+error: this reaches 'sh.sysl.musicbox.save_wav', which needs 'os', and 'thumbv6m-freestanding' does not provide it — a target's capabilities are what 'package.hocon' declares, so either this reference cannot be made on this machine or the config is understating it
+ --> main.sysl:7:5
+  |
+7 |     save_wav(sc, 22050, "out.wav") match
+  |     ^^^^^^^^
+```
+
+and under `@no_os`, *"this reaches 'sh.sysl.musicbox.save_wav', which needs 'os', and this module
+declared '@no_os'"*, pointing at the same call. These are commands rather than tests because the test
+harness builds for the host and has no way to expect a refusal.
 
 ## Testing
 
@@ -245,3 +290,7 @@ only if the quietest voice was taken), and saturation against twice a single not
 held to continuous play sample for sample, at points mid-attack, mid-decay, mid-sustain, mid-release,
 on a note's start, on a release point and between notes, deep into a long sustain, and past the voice
 pool.
+
+`save_wav` is tested through a real file: what it writes is read back and held to `render` sample for
+sample, a path in a missing directory answers `Write`, and a rate of zero answers `Render` and leaves
+no file.

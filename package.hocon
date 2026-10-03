@@ -4,17 +4,17 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.1" }
+//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.2" }
 //     }
 //
 // The coordinate names the package, `musicbox`; the module a program imports is `sh.sysl.musicbox`.
 
 package {
   name    = "musicbox"
-  version = "0.1.1"
+  version = "0.1.2"
 
   // The oldest compiler this package has been built and tested with.
-  sysl    = "0.0.155"
+  sysl    = "0.0.159"
 }
 
 // **`requires {}` is exact.** The renderer asks for no operating system, no clock, no files and no
@@ -24,7 +24,11 @@ package {
 // still builds it; the floats are in setting a score and a synth up, and the per-sample loop is
 // integer arithmetic.
 //
-// The heap users are `render_wav`, which grows a buffer for a whole file, and `parse`, which grows a
+// The one exception is `save_wav`, which writes a file, and it is marked `@needs(os)` rather than
+// stated here: since sysl 0.0.159 that charges `os` at a call to it, not to every program importing
+// the module, so a board that only renders still builds.
+//
+// The heap users are `render_wav` and `save_wav`, which grow a buffer for a whole file, and `parse`, which grows a
 // score's notes. A program that calls neither never reaches the allocator, which is why the
 // `parsing` dependency's own `requires { heap = true }` is not restated here.
 requires {
