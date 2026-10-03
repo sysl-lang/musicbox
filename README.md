@@ -6,7 +6,7 @@ same code renders a WAV file on a laptop and feeds an I2S buffer on a Pico.
 
 ```hocon
 dependencies {
-  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.2" }
+  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.3" }
 }
 ```
 
@@ -232,6 +232,12 @@ group left open points at where it was opened, and a key needing eight sharps sa
 
 ## Running on a board
 
+**A board build needs sysl 0.0.160 or later**, which is the package's floor. Before it, a consumer's
+build also read a dependency's `@tests` file at the consumer's target, and this package's tests import
+`sysl.fs` for a temporary directory -- so a freestanding build failed with *"'sysl.fs' declares no
+'make_temp_dir'"* though nothing the program called touched a file. From 0.0.160 a dependency's tests
+are its own suite's business only.
+
 `requires {}` is exact, and the package keeps no module storage an initializer would have to fill --
 the sine table is a literal, printed by `scripts/sine_table.py` and checked entry by entry by a test.
 The check is a probe program that calls `render`:
@@ -253,7 +259,7 @@ scores built with `note` and `score` instead.
 
 `save_wav` is the package's one reach into an operating system, and naming it costs nothing until a
 program calls it. Three probes, each a program directory with a `package.hocon` and one `main.sysl`
-with no `module` line and an `@export("main")` that calls the API (sysl 0.0.159):
+with no `module` line and an `@export("main")` that calls the API (sysl 0.0.160):
 
 ```
 sysl build-c <render-only probe> --target thumbv6m-freestanding --lib <this repo>
