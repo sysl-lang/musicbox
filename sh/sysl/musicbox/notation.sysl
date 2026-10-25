@@ -2,6 +2,7 @@ module sh.sysl.musicbox
 
 import sysl.buf.{Buf, buf}
 import sysl.math.Float
+import sysl.raw.str_cast
 import sysl.slices.sort_stable_by
 import sh.sysl.parsing.{Diagnostic, LitError, Number, Scanner, Span, error, expected, is_digit,
                         is_ident_cont, is_ident_start, nearest_name, read_digits, read_number,

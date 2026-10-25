@@ -4,6 +4,7 @@ module sh.sysl.musicbox
 import sysl.buf.{Buf, buf}
 import sysl.math.{Float, pi}
 import sysl.encoding.{get_u16_le, get_u32_le}
+import sysl.raw.str_cast
 import sysl.fs.{exists, make_temp_dir, read_bytes, remove_dir_all}
 
 // The parts underneath the renderer: fixed point, the sine table, scores and the WAV header. What a

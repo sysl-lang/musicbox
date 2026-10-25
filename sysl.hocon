@@ -4,19 +4,17 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.4" }
+//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.5" }
 //     }
 //
 // The coordinate names the package, `musicbox`; the module a program imports is `sh.sysl.musicbox`.
 
 package {
   name    = "musicbox"
-  version = "0.1.4"
+  version = "0.1.5"
 
-  // The oldest compiler this package has been built and tested with. A board build needs 0.0.160:
-  // before it, a consumer's build also read this package's `@tests` file, which imports `sysl.fs`,
-  // and so failed at a freestanding target.
-  sysl    = "0.0.160"
+  // The oldest compiler this package builds with: the `sysl.raw` imports need 0.6.0.
+  sysl    = "0.6.0"
 }
 
 // **`requires {}` is exact.** The renderer asks for no operating system, no clock, no files and no
@@ -38,5 +36,5 @@ requires {
 
 // The text notation reads through the organisation's parsing toolkit.
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.0" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.2" }
 }

@@ -6,7 +6,7 @@ same code renders a WAV file on a laptop and feeds an I2S buffer on a Pico.
 
 ```hocon
 dependencies {
-  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.4" }
+  musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.5" }
 }
 ```
 
