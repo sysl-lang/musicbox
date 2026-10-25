@@ -258,8 +258,8 @@ scores built with `note` and `score` instead.
 ### `save_wav` and `@needs(os)`
 
 `save_wav` is the package's one reach into an operating system, and naming it costs nothing until a
-program calls it. Three probes, each a program directory with a `package.hocon` and one `main.sysl`
-with no `module` line and an `@export("main")` that calls the API (sysl 0.0.160):
+program calls it. Three probes, each a program directory with a `sysl.hocon` and one `main.sysl`
+with no `module` line and an `@export("main")` that calls the API (sysl 0.6.0):
 
 ```
 sysl build-c <render-only probe> --target thumbv6m-freestanding --lib <this repo>
@@ -272,12 +272,15 @@ imports `sh.sysl.musicbox.*`, the module that declares `save_wav` and `SaveError
 too. A no-os probe that **calls** `save_wav` is refused, at the call:
 
 ```
-error: this reaches 'sh.sysl.musicbox.save_wav', which needs 'os', and 'thumbv6m-freestanding' does not provide it — a target's capabilities are what 'package.hocon' declares, so either this reference cannot be made on this machine or the config is understating it
- --> main.sysl:7:5
+error: this reaches 'sh.sysl.musicbox.save_wav', which needs 'os', and 'thumbv6m-freestanding' does not provide it — a target's capabilities are what 'sysl.hocon' declares, so either this reference cannot be made on this machine or the config is understating it
+ --> main.sysl:6:5
   |
-7 |     save_wav(sc, 22050, "out.wav") match
+6 |     save_wav(sc, 22050, "out.wav") match
   |     ^^^^^^^^
 ```
+
+(a second error follows, saying the program reaches `sysl.fs` and that a target with no operating
+system under it must `@export` the `sysl_fs_*` functions itself)
 
 and under `@no_os`, *"this reaches 'sh.sysl.musicbox.save_wav', which needs 'os', and this module
 declared '@no_os'"*, pointing at the same call. These are commands rather than tests because the test
