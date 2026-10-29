@@ -153,7 +153,7 @@ wav_samples_match_render()
     var block: [1024]i16
     s.render(block[..])
     for i in 0usize..<1024
-        val got = i16(get_u16_le(b[WAV_HEADER + 2 * i..<WAV_HEADER + 2 * i + 2]).unwrap())
+        val got = i16.wrap(get_u16_le(b[WAV_HEADER + 2 * i..<WAV_HEADER + 2 * i + 2]).unwrap())
         assert_eq(got, block[i], s"sample ${i}")
 
 @test("save_wav writes the file render_wav makes, samples and all")
@@ -178,7 +178,7 @@ save_wav_round_trip()
     while at < b.len
         s.render(block[..])
         for x in block
-            assert_eq(i16(get_u16_le(b[at..<at + 2]).unwrap()), x, s"byte ${at}")
+            assert_eq(i16.wrap(get_u16_le(b[at..<at + 2]).unwrap()), x, s"byte ${at}")
             at += 2
     assert_eq(at, b.len, "the file ends on a whole block")
 

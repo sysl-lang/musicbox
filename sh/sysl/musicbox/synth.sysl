@@ -144,7 +144,7 @@ private struct Voice
         var sum = Q31(0)
         for k in 0..<self.count
             sum = sum + sine(self.phases[k]) * self.amps[k]
-            self.phases[k] += self.incs[k]
+            self.phases[k] +%= self.incs[k]
 
         i64((sum * self.level).raw)
 
@@ -209,7 +209,7 @@ private struct Voice
     // Every partial at the phase continuous play would have turned it to by now: one increment for
     // each sample since the note began, wrapping as the accumulator does.
     private catch_up(*self)
-        for k in 0..<self.count do self.phases[k] = self.incs[k] * self.age
+        for k in 0..<self.count do self.phases[k] = self.incs[k] *% self.age
 
 private idle() -> Voice =
     Voice(Idle, Q31(0), Q31(0), 0, 0, 0, [0; MAX_PARTIALS], [0; MAX_PARTIALS], [Q31(0); MAX_PARTIALS], 0)

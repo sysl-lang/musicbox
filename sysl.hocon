@@ -4,17 +4,17 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.5" }
+//       musicbox { git = "github.com/sysl-lang/musicbox", version = "0.1.6" }
 //     }
 //
 // The coordinate names the package, `musicbox`; the module a program imports is `sh.sysl.musicbox`.
 
 package {
   name    = "musicbox"
-  version = "0.1.5"
+  version = "0.1.6"
 
   // The oldest compiler this package builds with: the `sysl.raw` imports need 0.6.0.
-  sysl    = "0.6.0"
+  sysl    = "0.8.0"
 }
 
 // **`requires {}` is exact.** The renderer asks for no operating system, no clock, no files and no

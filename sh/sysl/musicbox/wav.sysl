@@ -54,8 +54,8 @@ render_wav(score: Score, rate: u32) -> Result[Buf[u8], MusicError]
     while more
         more = s.render(chunk[..])
         for x in chunk
-            bytes.push(u8(x))
-            bytes.push(u8(x >> 8))
+            bytes.push(u8.wrap(x))
+            bytes.push(u8.wrap(x >> 8))
         frames += 1024
 
     if !wav_header(bytes.view(), rate, frames) then return Err(TooLong)
