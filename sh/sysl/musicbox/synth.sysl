@@ -83,13 +83,13 @@ private patch(ins: Instrument, rate: real) -> Patch
 
     val shape = ins.envelope match
         Adsr(a, d, s, r, curve) ->
-            val attack = max(a * rate, 1.0)
-            val decay = max(d * rate, 1.0)
-            val release = max(r, MIN_RELEASE) * rate
+            val attack = (a * rate).max(1.0)
+            val decay = (d * rate).max(1.0)
+            val release = r.max(MIN_RELEASE) * rate
             Ramp(i32(2147483647.0 / attack) + 1, segment(decay, curve, s), q31(s), segment(release, curve, 0.0))
         Pluck(d, r) ->
-            val decay = max(d * rate, 1.0)
-            val release = max(r, MIN_RELEASE) * rate
+            val decay = (d * rate).max(1.0)
+            val release = r.max(MIN_RELEASE) * rate
             Fall(q31((0.001.ln() / decay).exp()), segment(release, DEFAULT_CURVE, 0.0))
 
     Patch(ratios, amps, count, shape)
