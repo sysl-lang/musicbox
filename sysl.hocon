@@ -36,5 +36,5 @@ requires {
 
 // The text notation reads through the organisation's parsing toolkit.
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.14.1" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.14.2" }
 }

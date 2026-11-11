@@ -267,7 +267,7 @@ private played(sc: Score, at: usize, n: usize) -> Buf[i16]
         s.render(block[..<k])
         done += k
     var out = zeros(n)
-    s.render(out.view())
+    s.render(out.view_mut())
     out
 
 // `n` samples from a synth that seeks straight to `at`.
@@ -276,7 +276,7 @@ private seeked(sc: Score, at: usize, n: usize) -> Buf[i16]
     s.seek(u64(at))
     assert_eq(s.position(), u64(at))
     var out = zeros(n)
-    s.render(out.view())
+    s.render(out.view_mut())
     out
 
 private zeros(n: usize) -> Buf[i16]

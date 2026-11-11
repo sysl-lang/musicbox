@@ -99,7 +99,7 @@ parse_with(text: string, registered: []const Named) -> Result[Score, Diagnostic]
     // them in start order and keeps a chord's notes, and simultaneous voices, in the order written.
     var scratch: Buf[Note] = buf()
     scratch.extend(r.notes.view())
-    sort_stable_by(r.notes.view(), scratch.view(), (a, b) -> a.start < b.start)
+    sort_stable_by(r.notes.view_mut(), scratch.view_mut(), (a, b) -> a.start < b.start)
 
     score(r.notes.view(), r.instruments.view()) match
         Ok(sc) -> Ok(sc)

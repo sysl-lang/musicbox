@@ -58,7 +58,7 @@ render_wav(score: Score, rate: u32) -> Result[Buf[u8], MusicError]
             bytes.push(u8.wrap(x >> 8))
         frames += 1024
 
-    if !wav_header(bytes.view(), rate, frames) then return Err(TooLong)
+    if !wav_header(bytes.view_mut(), rate, frames) then return Err(TooLong)
     Ok(bytes)
 
 // Why `save_wav` did not leave a file behind: the score would not render, or the file would not write.
